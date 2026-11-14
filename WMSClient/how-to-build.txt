@@ -1,0 +1,159 @@
+Пошаговая сборка APK
+========================================
+
+Подготовка
+----------
+1. Установи Android Studio:
+   https://developer.android.com/studio
+
+2. Новый проект: New Project → Empty Activity.
+   - Name:        WMSClient
+   - Package:     com.wms.client
+   - Language:    Kotlin
+   - Minimum SDK: API 24
+   - Build config: Kotlin DSL
+
+3. Удали автотесты:
+   - ПКМ по app/src/androidTest/ → Delete
+   - ПКМ по app/src/test/        → Delete
+
+
+Подмена файлов
+--------------
+Замени содержимое:
+  - app/build.gradle.kts
+  - app/proguard-rules.pro
+  - build.gradle.kts (корневой)
+  - settings.gradle.kts
+  - gradle.properties
+  - app/src/main/AndroidManifest.xml
+  - app/src/main/res/values/strings.xml
+  - app/src/main/res/values/themes.xml
+
+Удали автосозданный MainActivity.kt и создай структуру заново.
+Все файлы плоские (без подпакетов, кроме api и view):
+
+  app/src/main/java/com/wms/client/MainActivity.kt
+  app/src/main/java/com/wms/client/WmsViewModel.kt
+  app/src/main/java/com/wms/client/UiConfigStore.kt
+  app/src/main/java/com/wms/client/ActionDispatcher.kt
+  app/src/main/java/com/wms/client/Heartbeat.kt
+  app/src/main/java/com/wms/client/NotificationsPoller.kt
+  app/src/main/java/com/wms/client/Lang.kt
+  app/src/main/java/com/wms/client/api/Api.kt
+  app/src/main/java/com/wms/client/api/UiConfig.kt
+  app/src/main/java/com/wms/client/view/ViewNode.kt
+  app/src/main/java/com/wms/client/view/ViewRenderer.kt
+
+
+Иконка и логотип
+----------------
+1. Иконка приложения (квадратная):
+   - ПКМ по res → New → Image Asset
+   - Name: ic_launcher
+   - Path: путь к icon.png
+   - Next → Finish
+
+2. Горизонтальный логотип (для экранов входа):
+   - Создай папку app/src/main/res/drawable/ (если нет).
+   - Скопируй туда logo_horizontal.png.
+   - Имя строго маленькими буквами: logo_horizontal.png.
+
+MainActivity.kt ссылается на R.drawable.logo_horizontal.
+
+
+Сборка — ОБЯЗАТЕЛЬНО RELEASE
+----------------------------
+Debug-сборка Compose в разы медленнее release. На слабых ТСД
+(Newland MT-65 Beluga 3 и подобные) debug-APK заметно лагает —
+особенно drawer и переключение экранов.
+
+1. File → Sync Project with Gradle Files
+2. Панель Build Variants (слева, снизу) → app → release
+   (если её нет: View → Tool Windows → Build Variants).
+3. Build → Build Bundle(s) / APK(s) → Build APK(s)
+4. APK появится в:
+   WMSClient/app/build/outputs/apk/release/app-release-unsigned.apk
+   (если не настроена подпись — подпишите любым ключом, для
+   внутреннего использования годится debug-ключ, см. ниже)
+
+Для тестовой подписи release-ключа добавьте в app/build.gradle.kts
+внутри release:
+   signingConfig = signingConfigs.getByName("debug")
+Тогда APK появится как app-release.apk и поставится на устройство
+без ручной подписи. Для продакшена — отдельный keystore.
+
+Проверка, что это действительно release:
+  adb shell dumpsys package com.wms.client | grep flags
+В выводе не должно быть DEBUGGABLE.
+
+
+Установка на ТСД / телефон
+--------------------------
+1. Скопируй APK на устройство.
+2. Настройки → Безопасность → Разрешить установку
+   из неизвестных источников.
+3. Открой APK, установи.
+4. Запусти.
+5. Первый запуск — экран «Настройки сканера». Выбери:
+   - «ТСД — терминал сбора данных» — если у устройства
+     есть встроенный HID-сканер (Newland MT-65 и подобные).
+   - «Android-устройство без сканера» — если это обычный
+     телефон/планшет, сканирование через камеру.
+6. Отсканируй QR сервера (панель «ШК сервера» в разделе
+   «Задания» на ПК), затем QR пропуска сотрудника.
+
+
+Особенности Android-клиента
+---------------------------
+- Клиент тонкий: рендерит view-дерево, не знает предметную
+  область.
+- Два режима сканирования (выбираются при первом запуске,
+  меняются из drawer → «Настройки сканера»):
+
+  * ТСД (pda) — HID-сканер перехватывается в
+    MainActivity.dispatchKeyEvent. Никаких скрытых полей ввода,
+    никакого AndroidView. Скан = последовательность символов +
+    Enter (или пауза 250 мс).
+
+  * Телефон (phone) — встроенное превью камеры (EmbeddedCameraScanner)
+    внизу экрана задания/сессии. Сверху видно, что и сколько
+    сканировать. Сканирование непрерывное с кулдауном 1 секунда
+    между срабатываниями (защита от «автомата»).
+    На экранах логина (QR сервера / пропуска) — полноэкранный
+    CaptureActivity (zxing), портретная ориентация.
+
+- Сессии приёмки на ТСД не показываются: сервер фильтрует
+  их по device="android". Если плагин зарегистрирует сессию
+  с platforms=("android",) — она появится (тоже со встроенным
+  сканером в phone-режиме).
+- Кнопки с value="ask" показывают диалог перед отправкой.
+- Узел table — таблица с фото/названием/ШК/количеством.
+- Офлайн: heartbeat 10 сек в норме, 2 сек пока офлайн;
+  после 3 неудач подряд — оверлей «Нет связи».
+- Task watcher опрашивает /tasks/{id}/status раз в 8 сек.
+- Сверху плашка «Блок 45 · Часть 1 из 2», если это batch.
+- Drawer: ширина 240 dp, анимация 120 мс линейная.
+- Настройки сканера на маленьких экранах прокручиваются —
+  карточки не обрезаются.
+
+
+Известные ограничения
+---------------------
+- Debug APK медленный. Всегда собирайте release для реальных
+  устройств.
+- Встроенный сканер (phone) требует разрешения на камеру. При
+  отказе в блоке сканера показывается «Нет доступа к камере»
+  и кнопка «Разрешить».
+- На MT-65 Beluga 3 (2018, 2 ГБ RAM) Compose работает на пределе
+  своих возможностей даже в release. Если после всех оптимизаций
+  UI всё ещё недостаточно плавный — см. рекомендации в
+  USER_GUIDE.md (раздел 20) или рассмотрите гибридный подход
+  (RecyclerView для экранов задания/сессии).
+
+
+Обновление APK
+--------------
+Собери новый release APK и установи поверх. Старые версии
+несовместимы с новым протоколом — переустанови с нуля,
+если были изменения в API.

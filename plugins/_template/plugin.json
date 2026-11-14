@@ -1,0 +1,14 @@
+{
+  "name": "my_plugin",
+  "title": "Мой плагин",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "author": "Автор",
+  "description": "Краткое описание того, что делает плагин.",
+  "entry": "plugin.py",
+  "hooks": [],
+  "creates_tables": [],
+  "reads_tables": [],
+  "writes_tables": [],
+  "dependencies": []
+}

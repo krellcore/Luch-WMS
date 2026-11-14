@@ -1,0 +1,17 @@
+{
+  "audit.title": "Cell audit",
+  "audit.role_title": "Cell audit",
+  "audit.prompt_scan_cell": "Go to cell {addr} and scan its barcode",
+  "audit.prompt_confirm_cell": "Cell {addr}: confirm the check?",
+  "audit.prompt_finish": "All cells checked. Finish audit?",
+  "audit.btn_create": "+ Create audit",
+  "audit.btn_refresh": "Refresh",
+  "audit.btn_confirm": "Confirm",
+  "audit.btn_finish": "Finish audit",
+  "audit.btn_cancel": "Cancel",
+  "audit.empty": "No audits yet",
+  "audit.pda_empty": "No active audits",
+  "audit.pda_hint": "Get a task via «Get task».",
+  "audit.dialog_title": "New audit",
+  "audit.dialog_caption": "Choose a cell to check"
+}

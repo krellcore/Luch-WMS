@@ -1,0 +1,14 @@
+{
+  "name": "example_hooks",
+  "title": "Пример: хуки и свой тип задания",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "author": "WMS Team",
+  "description": "Перехватывает ШК 'SPECIAL-', регистрирует свой тип задания 'special' и использует helpers.py.",
+  "entry": "plugin.py",
+  "hooks": ["on_scan", "on_view_build"],
+  "creates_tables": [],
+  "reads_tables": [],
+  "writes_tables": [],
+  "dependencies": []
+}

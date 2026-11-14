@@ -1,0 +1,14 @@
+{
+  "name": "example_audit",
+  "title": "Аудит ячеек",
+  "version": "1.0.0",
+  "api_version": "1.0",
+  "author": "WMS Team",
+  "description": "Демо-плагин: mgmt-страница, пункт меню на ТСД, свой тип задания 'audit' + своя роль 'audit'. Языки плагина — в plugins/example_audit/lang/.",
+  "entry": "plugin.py",
+  "hooks": [],
+  "creates_tables": ["audit_log"],
+  "reads_tables": ["tasks", "task_items", "cells", "employees"],
+  "writes_tables": ["tasks", "task_items", "audit_log"],
+  "dependencies": []
+}

@@ -1,0 +1,17 @@
+{
+  "audit.title": "Zellprüfung",
+  "audit.role_title": "Zellprüfung",
+  "audit.prompt_scan_cell": "Gehen Sie zur Zelle {addr} und scannen Sie ihren Strichcode",
+  "audit.prompt_confirm_cell": "Zelle {addr}: Prüfung bestätigen?",
+  "audit.prompt_finish": "Alle Zellen geprüft. Prüfung abschließen?",
+  "audit.btn_create": "+ Prüfung erstellen",
+  "audit.btn_refresh": "Aktualisieren",
+  "audit.btn_confirm": "Bestätigen",
+  "audit.btn_finish": "Prüfung abschließen",
+  "audit.btn_cancel": "Abbrechen",
+  "audit.empty": "Noch keine Prüfungen",
+  "audit.pda_empty": "Keine aktiven Prüfungen",
+  "audit.pda_hint": "Holen Sie die Aufgabe über «Aufgabe holen».",
+  "audit.dialog_title": "Neue Prüfung",
+  "audit.dialog_caption": "Wählen Sie die zu prüfende Zelle"
+}

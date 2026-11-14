@@ -1,0 +1,17 @@
+{
+  "audit.title": "Аудит ячеек",
+  "audit.role_title": "Аудит ячеек",
+  "audit.prompt_scan_cell": "Подойдите к ячейке {addr} и отсканируйте её ШК",
+  "audit.prompt_confirm_cell": "Ячейка {addr}: подтвердить проверку?",
+  "audit.prompt_finish": "Все ячейки проверены. Завершить аудит?",
+  "audit.btn_create": "+ Создать аудит",
+  "audit.btn_refresh": "Обновить",
+  "audit.btn_confirm": "Подтвердить",
+  "audit.btn_finish": "Завершить аудит",
+  "audit.btn_cancel": "Отмена",
+  "audit.empty": "Аудитов ещё нет",
+  "audit.pda_empty": "Нет активных аудитов",
+  "audit.pda_hint": "Возьмите задание через «Получить задание».",
+  "audit.dialog_title": "Новый аудит",
+  "audit.dialog_caption": "Выберите ячейку для проверки"
+}
