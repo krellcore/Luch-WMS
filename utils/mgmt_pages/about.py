@@ -12,7 +12,7 @@ from mgmt_view_builder import build_sidebar
 from i18n import tr, current_locale
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 
 _TABLE_STYLE = (

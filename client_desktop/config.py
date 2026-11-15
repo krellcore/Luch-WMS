@@ -24,14 +24,6 @@ def save_config(cfg):
 
 # ================================================================
 # ui_cache — полный /ui_config по каждому серверу.
-#
-# config.json:
-#   "ui_cache": {
-#     "http://192.168.0.10:8765": {
-#       "version": "abc123",
-#       "config":  { theme, branding, screens, locales, menu, roles }
-#     }
-#   }
 # ================================================================
 
 def get_ui_cache(cfg, server_url):
@@ -55,13 +47,6 @@ def set_ui_cache(cfg, server_url, version, config):
 
 # ================================================================
 # settings_cache — /settings по паре (server, login).
-#
-# config.json:
-#   "settings_cache": {
-#     "http://192.168.0.10:8765|ivanov": {
-#       "settings": { "prefix_cell": "C-", ... }
-#     }
-#   }
 # ================================================================
 
 def get_settings_cache(cfg, server_url, login):
@@ -79,4 +64,42 @@ def set_settings_cache(cfg, server_url, login, settings):
     key = f"{server_url}|{login}"
     cache[key] = {"settings": dict(settings or {})}
     cfg["settings_cache"] = cache
+    return cfg
+
+
+# ================================================================
+# tls_certs — сохранённые сертификаты серверов (pinning).
+#
+#   "tls_certs": {
+#     "https://192.168.1.10:8765": {
+#        "fp":  "<base64url(sha256(der))>",
+#        "pem": "-----BEGIN CERTIFICATE-----\n..."
+#     }
+#   }
+# ================================================================
+
+def get_tls_cache(cfg, server_url):
+    if not server_url:
+        return None
+    entry = (cfg.get("tls_certs") or {}).get(server_url)
+    if not entry or not isinstance(entry, dict):
+        return None
+    return entry
+
+
+def set_tls_cache(cfg, server_url, fp, pem):
+    if not server_url:
+        return cfg
+    cache = cfg.get("tls_certs") or {}
+    cache[server_url] = {"fp": fp or "", "pem": pem or ""}
+    cfg["tls_certs"] = cache
+    return cfg
+
+
+def del_tls_cache(cfg, server_url):
+    if not server_url:
+        return cfg
+    cache = cfg.get("tls_certs") or {}
+    cache.pop(server_url, None)
+    cfg["tls_certs"] = cache
     return cfg

@@ -1,19 +1,16 @@
-"""HTTP-сервер для клиентов."""
+"""HTTP/HTTPS-сервер для клиентов."""
 
 import base64
 import json
 import os
-import secrets
 import socket
 import sqlite3
 import threading
 import time
 import traceback
-import hashlib
 from collections import deque
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
 
 from ui_config import get_versioned
 from view_builder import (
@@ -28,6 +25,9 @@ from plugin_hooks import registry as hook_registry
 from db import (
     expire_reservations, refresh_task_reservations,
     release_task, RESERVE_ACTIVE_MINUTES,
+    hash_password, verify_password, needs_rehash,
+    create_auth_session, verify_auth_session,
+    invalidate_session_by_token,
 )
 from tasks import (
     get_handler, has_handler, list_task_types,
@@ -36,6 +36,10 @@ from roles import task_types_for_roles
 from i18n import (
     set_locale, tr, current_locale, load_locale_for_manager,
     save_locale_for_manager,
+)
+from tls import (
+    make_server_context, has_cert, cert_fingerprint,
+    tls_dir as tls_cert_dir,
 )
 
 from mgmt_protocol import (
@@ -200,6 +204,57 @@ _stats = _ServerStats()
 
 
 # ================================================================
+# Rate limit для логинов
+# ================================================================
+
+class _RateLimiter:
+    def __init__(self, max_attempts=10, window=300, block=900):
+        self._lock = threading.Lock()
+        self._attempts = {}
+        self._blocks = {}
+        self.max = max_attempts
+        self.window = window
+        self.block = block
+
+    def check(self, ip, login):
+        """Возвращает (ok: bool, wait_seconds: int)."""
+        key = (ip or "", (login or "").lower())
+        now = time.time()
+        with self._lock:
+            until = self._blocks.get(key)
+            if until and until > now:
+                return False, int(until - now)
+            dq = self._attempts.get(key)
+            if dq:
+                while dq and now - dq[0] > self.window:
+                    dq.popleft()
+                if len(dq) >= self.max:
+                    self._blocks[key] = now + self.block
+                    self._attempts[key] = deque()
+                    return False, int(self.block)
+            return True, 0
+
+    def hit(self, ip, login):
+        key = (ip or "", (login or "").lower())
+        with self._lock:
+            dq = self._attempts.get(key)
+            if dq is None:
+                dq = deque()
+                self._attempts[key] = dq
+            dq.append(time.time())
+
+    def reset(self, ip, login):
+        key = (ip or "", (login or "").lower())
+        with self._lock:
+            self._attempts.pop(key, None)
+            self._blocks.pop(key, None)
+
+
+_login_limiter = _RateLimiter()
+_MAX_BODY = 2 * 1024 * 1024  # 2 MB
+
+
+# ================================================================
 
 def _make_item_barcode_png(code, width=600, height=220):
     try:
@@ -273,6 +328,19 @@ def _all_ipv4():
     return ips
 
 
+_ipv4_cache = {"ips": [], "ts": 0.0}
+
+
+def _all_ipv4_cached():
+    now = time.time()
+    if now - _ipv4_cache["ts"] < 60:
+        return list(_ipv4_cache["ips"])
+    ips = _all_ipv4()
+    _ipv4_cache["ips"] = ips
+    _ipv4_cache["ts"] = now
+    return list(ips)
+
+
 def _translate_notification(row):
     payload_raw = row.get("payload") or ""
     if not payload_raw:
@@ -306,11 +374,6 @@ def _translate_notification(row):
     return row
 
 
-def _hash_password(secret: str) -> str:
-    return hashlib.sha256(
-        secret.encode("utf-8")).hexdigest()
-
-
 def _valid_mgr_login(login: str) -> bool:
     if not login:
         return False
@@ -332,8 +395,18 @@ def _check_task_assignee(task, login):
     return None
 
 
+def _client_ip(handler):
+    try:
+        if handler.client_address:
+            return str(handler.client_address[0])
+    except Exception:
+        pass
+    return ""
+
+
 class Handler(BaseHTTPRequestHandler):
     db_path = None
+    timeout = 15
 
     def _photo_b64(self, cur, item_code):
         if not item_code:
@@ -387,11 +460,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_json(self):
         try:
-            length = int(self.headers.get("Content-Length", 0))
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except Exception:
+            self._req_in = 0
+            return None
+        if length < 0 or length > _MAX_BODY:
+            self._req_in = 0
+            return None
+        try:
             raw = self.rfile.read(length) if length else b"{}"
             self._req_in = length
             return json.loads(raw.decode("utf-8"))
         except Exception:
+            self._req_in = 0
             return None
 
     def _default_locale(self):
@@ -408,12 +489,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return "ru"
 
+    # ---------------- Аутентификация ----------------
+
     def _auth(self, data):
-        login = data.get("login")
-        secret = data.get("secret")
+        login = (data.get("login") or "").strip()
+        secret = data.get("secret") or ""
         if not login or not secret:
             return None
-        secret_hash = _hash_password(secret)
         conn = self._conn()
         try:
             cur = conn.cursor()
@@ -422,25 +504,7 @@ class Handler(BaseHTTPRequestHandler):
             r = cur.fetchone()
         finally:
             conn.close()
-        if not r or r["pass_hash"] != secret_hash:
-            return None
-        return login
-
-    def _auth_token(self, data):
-        token = data.get("token", "")
-        if "-" not in token:
-            return None
-        login, secret = token.split("-", 1)
-        secret_hash = _hash_password(secret)
-        conn = self._conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT login, pass_hash FROM employees "
-                        "WHERE login=?", (login,))
-            r = cur.fetchone()
-        finally:
-            conn.close()
-        if not r or r["pass_hash"] != secret_hash:
+        if not r or not verify_password(secret, r["pass_hash"] or ""):
             return None
         return login
 
@@ -449,7 +513,6 @@ class Handler(BaseHTTPRequestHandler):
         secret = data.get("secret") or ""
         if not login or not secret:
             return None
-        secret_hash = _hash_password(secret)
         conn = self._conn()
         try:
             cur = conn.cursor()
@@ -459,39 +522,39 @@ class Handler(BaseHTTPRequestHandler):
             r = cur.fetchone()
         finally:
             conn.close()
-        if not r or r["pass_hash"] != secret_hash:
+        if not r or not verify_password(secret, r["pass_hash"] or ""):
             return None
         return login
 
+    def _auth_token(self, data):
+        token = (data.get("token") or "").strip()
+        if not token:
+            return None
+        sess = verify_auth_session(self.db_path, token)
+        if not sess or sess.get("kind") != "employee":
+            return None
+        return sess["login"]
+
     def _mgmt_auth_token(self, data):
         token = (data.get("token") or "").strip()
-        if "-" not in token:
+        if not token:
             return None
-        login, secret = token.split("-", 1)
-        secret_hash = _hash_password(secret)
-        conn = self._conn()
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT login, pass_hash, role "
-                "FROM managers WHERE login=?", (login,))
-            r = cur.fetchone()
-        finally:
-            conn.close()
-        if not r or r["pass_hash"] != secret_hash:
+        sess = verify_auth_session(self.db_path, token)
+        if not sess or sess.get("kind") != "manager":
             return None
-        return {
-            "login": r["login"],
-            "role": (r["role"] or "operator"),
-        }
+        return {"login": sess["login"],
+                "role": sess.get("role") or "operator"}
 
     def _guess_client(self, parts, data):
         if not parts:
             return None
         token = (data.get("token") or "").strip()
-        if "-" not in token:
+        if not token:
             return None
-        login, _secret = token.split("-", 1)
+        sess = verify_auth_session(self.db_path, token)
+        if not sess:
+            return None
+        login = sess["login"]
         top = parts[0]
         if top == "mgmt":
             kind = "admin"
@@ -509,12 +572,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 caps = cap_registry.get(login)
                 device = getattr(caps, "device", "") or "unknown"
-        ip = ""
-        try:
-            if self.client_address:
-                ip = str(self.client_address[0])
-        except Exception:
-            ip = ""
+        ip = _client_ip(self)
         return (login, kind, device, ip)
 
     # ================================================================
@@ -539,20 +597,37 @@ class Handler(BaseHTTPRequestHandler):
                          "error": "unknown mgmt route"})
 
     def _mgmt_login(self, data):
+        ip = _client_ip(self)
+        login_v = (data.get("login") or "").strip()
+
+        ok, wait = _login_limiter.check(ip, login_v)
+        if not ok:
+            return self._send(200, {
+                "ok": False,
+                "error": f"too many attempts, wait {wait}s",
+            })
+
         login = self._mgmt_auth(data)
         if not login:
+            _login_limiter.hit(ip, login_v)
             return self._send(200, {
                 "ok": False,
                 "error": "invalid credentials",
             })
-        secret = data.get("secret") or ""
-        token = f"{login}-{secret}"
+        _login_limiter.reset(ip, login_v)
+
         conn = self._conn()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT role FROM managers WHERE login=?",
-                        (login,))
+            cur.execute(
+                "SELECT role, pass_hash FROM managers WHERE login=?",
+                (login,))
             r = cur.fetchone()
+            if r and needs_rehash(r["pass_hash"] or ""):
+                cur.execute(
+                    "UPDATE managers SET pass_hash=? WHERE login=?",
+                    (hash_password(data.get("secret") or ""), login))
+                conn.commit()
         finally:
             conn.close()
         role = (r["role"] if r else "operator") or "operator"
@@ -586,6 +661,9 @@ class Handler(BaseHTTPRequestHandler):
             user_locale = req_locale
         effective_locale = user_locale or self._default_locale()
 
+        token = create_auth_session(
+            self.db_path, login, "manager", role=role, ip=ip)
+
         self._send(200, {
             "ok": True,
             "token": token,
@@ -617,6 +695,12 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _mgmt_logout(self, data):
+        token = (data.get("token") or "").strip()
+        if token:
+            try:
+                invalidate_session_by_token(self.db_path, token)
+            except Exception:
+                pass
         self._send(200, {"ok": True})
 
     def _mgmt_pages(self, data):
@@ -838,9 +922,14 @@ class Handler(BaseHTTPRequestHandler):
     # ================================================================
 
     def _status(self):
+        ip = _client_ip(self)
+        if ip not in ("127.0.0.1", "::1", ""):
+            return self._send(403, {"ok": False,
+                                    "error": "forbidden"})
         data = _stats.snapshot()
         data["warehouse"] = os.path.basename(
             os.path.dirname(os.path.abspath(self.db_path)))
+        data["tls"] = _tls_enabled
         self._send(200, data)
 
     def do_POST(self):
@@ -878,18 +967,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             set_locale("ru")
         try:
-            if self.path.startswith("/barcodes/item/"):
-                code = unquote(self.path[len("/barcodes/item/"):])
-                data = _make_item_barcode_png(code)
-                if data:
-                    self._send_png(data)
-                else:
-                    self._send(404, {"ok": False,
-                                     "error": "no barcode"})
-                return
-            if self.path.startswith("/plugin/"):
-                self._plugin_get(self.path)
-                return
+            # GET больше не обслуживает эндпоинты: плагинные
+            # эндпоинты требуют авторизации через POST,
+            # /barcodes/item/* удалён.
             self._send(405, {"ok": False, "error": "use POST"})
         finally:
             _stats.register_request(self._req_in, self._req_out)
@@ -903,12 +983,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {
                 "ok": True, "server": "luch",
                 "protocol": PROTOCOL_VERSION,
+                "tls": _tls_enabled,
                 "ts": datetime.now().isoformat(),
             })
         if parts == ["status"]:
             return self._status()
         if parts == ["login"]:
             return self._login(data)
+        if parts == ["logout"]:
+            return self._logout(data)
         if parts and parts[0] == "mgmt":
             return self._mgmt(parts, data)
         if parts and parts[0] == "ui_config":
@@ -939,15 +1022,53 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"ok": False, "error": "not found"})
 
     def _login(self, data):
+        ip = _client_ip(self)
+        login_v = (data.get("login") or "").strip()
+
+        ok, wait = _login_limiter.check(ip, login_v)
+        if not ok:
+            return self._send(200, {
+                "ok": False,
+                "error": f"too many attempts, wait {wait}s",
+            })
+
         login = self._auth(data)
         if not login:
+            _login_limiter.hit(ip, login_v)
             return self._send(200, {"ok": False,
                                     "error": "invalid credentials"})
+        _login_limiter.reset(ip, login_v)
+
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT pass_hash FROM employees WHERE login=?",
+                        (login,))
+            r = cur.fetchone()
+            if r and needs_rehash(r["pass_hash"] or ""):
+                cur.execute(
+                    "UPDATE employees SET pass_hash=? WHERE login=?",
+                    (hash_password(data.get("secret") or ""), login))
+                conn.commit()
+        finally:
+            conn.close()
+
+        token = create_auth_session(
+            self.db_path, login, "employee", ip=ip)
         self._send(200, {
             "ok": True,
-            "token": f"{login}-{data['secret']}",
+            "token": token,
             "protocol": PROTOCOL_VERSION,
         })
+
+    def _logout(self, data):
+        token = (data.get("token") or "").strip()
+        if token:
+            try:
+                invalidate_session_by_token(self.db_path, token)
+            except Exception:
+                pass
+        self._send(200, {"ok": True})
 
     def _ui_config(self, parts, data):
         version, cfg = get_versioned(self.db_path)
@@ -1029,7 +1150,7 @@ class Handler(BaseHTTPRequestHandler):
                 "actions": ["scan", "tap", "input_submit",
                             "cancel", "custom"],
                 "features": ["assets", "notifications",
-                             "heartbeat"],
+                             "heartbeat", "tls"],
             },
         })
 
@@ -1305,7 +1426,7 @@ class Handler(BaseHTTPRequestHandler):
                             cur, conn, task_id, login, data)
                     if action == "status":
                         return self._task_status(
-                            cur, conn, task_id)
+                            cur, conn, task_id, login)
                     if action == "action":
                         return self._task_action(
                             cur, conn, task_id, login, data)
@@ -1321,13 +1442,19 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
-    def _task_status(self, cur, conn, task_id):
+    def _task_status(self, cur, conn, task_id, login):
         cur.execute("""
             SELECT id, status, assignee_login FROM tasks WHERE id=?
         """, (task_id,))
         r = cur.fetchone()
         if not r:
             return self._send(200, {"ok": True, "exists": False})
+        assignee = (r["assignee_login"] or "").strip()
+        if assignee and assignee != login:
+            return self._send(200, {
+                "ok": True, "exists": False,
+                "status": "", "assignee_login": "",
+            })
         if r["status"] == "in_progress":
             refresh_task_reservations(
                 cur, task_id, RESERVE_ACTIVE_MINUTES)
@@ -2071,33 +2198,20 @@ class Handler(BaseHTTPRequestHandler):
         if not parts:
             return self._send(404, {"ok": False,
                                     "error": "no plugin path"})
+        login = self._auth_token(data)
+        if not login:
+            return self._send(401, {"ok": False,
+                                    "error": "unauthorized"})
         plugin_name = parts[0]
         path = "/plugin/" + plugin_name + "/" + "/".join(parts[1:])
         handler = _find_plugin_endpoint(path, "POST")
         if not handler:
             return self._send(404, {"ok": False,
                                     "error": "no handler"})
-        login = self._auth_token(data)
         try:
             result = handler({
                 "method": "POST", "path": path,
                 "data": data, "login": login,
-            })
-            self._send(200, result if isinstance(result, dict)
-                       else {"ok": True, "result": result})
-        except Exception as e:
-            traceback.print_exc()
-            self._send(500, {"ok": False, "error": str(e)})
-
-    def _plugin_get(self, path):
-        handler = _find_plugin_endpoint(path, "GET")
-        if not handler:
-            return self._send(404, {"ok": False,
-                                    "error": "no handler"})
-        try:
-            result = handler({
-                "method": "GET", "path": path,
-                "data": {}, "login": None,
             })
             self._send(200, result if isinstance(result, dict)
                        else {"ok": True, "result": result})
@@ -2229,19 +2343,28 @@ def _find_plugin_endpoint(path, method):
 
 _server = None
 _thread = None
+_tls_enabled = False
+_warehouse_dir = None
 
 
 def server_url():
-    ips = _all_ipv4()
+    ips = _all_ipv4_cached()
     ip = ips[0] if ips else "127.0.0.1"
-    return f"WMS://{ip}:8765"
+    base = f"WMS://{ip}:8765"
+    if _tls_enabled and _warehouse_dir:
+        fp = cert_fingerprint(_warehouse_dir)
+        if fp:
+            base += f"#fp={fp}"
+    return base
 
 
-def start_server(db_path, host="0.0.0.0", port=8765):
-    global _server, _thread
+def start_server(db_path, host="0.0.0.0", port=8765, tls=False):
+    global _server, _thread, _tls_enabled, _warehouse_dir
     if _server is not None:
         return _server
     Handler.db_path = db_path
+    Handler.timeout = 15
+    _warehouse_dir = os.path.dirname(os.path.abspath(db_path))
 
     try:
         conn = sqlite3.connect(db_path)
@@ -2280,6 +2403,15 @@ def start_server(db_path, host="0.0.0.0", port=8765):
                 payload TEXT DEFAULT '{}',
                 created_at TEXT,
                 UNIQUE(login, session_key))""",
+            """CREATE TABLE IF NOT EXISTS auth_sessions (
+                token_hash TEXT PRIMARY KEY,
+                login TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                role TEXT DEFAULT '',
+                created_at TEXT,
+                expires_at TEXT,
+                last_seen_at TEXT,
+                ip TEXT DEFAULT '')""",
         ]:
             conn.execute(sql)
         conn.commit()
@@ -2287,27 +2419,63 @@ def start_server(db_path, host="0.0.0.0", port=8765):
     except Exception as e:
         print("start_server миграция:", e)
 
+    tls_ctx = None
+    if tls:
+        if not has_cert(_warehouse_dir):
+            raise RuntimeError(
+                "TLS: сертификат не найден в "
+                f"{tls_cert_dir(_warehouse_dir)}. "
+                "Перевыпустите сертификат в "
+                "«Настройки → Безопасность».")
+        tls_ctx = make_server_context(_warehouse_dir)
+
     try:
         _server = ThreadingHTTPServer((host, port), Handler)
     except OSError as e:
         print(f"[server] НЕ УДАЛОСЬ занять порт {port}: {e}")
         raise
 
+    if tls_ctx is not None:
+        try:
+            _server.socket = tls_ctx.wrap_socket(
+                _server.socket, server_side=True)
+            _tls_enabled = True
+        except Exception as e:
+            print(f"[server] TLS wrap: {e}")
+            try:
+                _server.server_close()
+            except Exception:
+                pass
+            _server = None
+            raise
+
     _thread = threading.Thread(target=_server.serve_forever,
                                daemon=True)
     _thread.start()
 
+    scheme = "https" if _tls_enabled else "http"
     print("=" * 60)
-    print(f"[server] слушаем на {host}:{port}")
-    for ip in _all_ipv4():
-        print(f"[server]     http://{ip}:{port}")
-    print(f"[server]     http://127.0.0.1:{port}")
+    print(f"[server] слушаем на {host}:{port} ({scheme.upper()})")
+    for ip in _all_ipv4_cached():
+        print(f"[server]     {scheme}://{ip}:{port}")
+    print(f"[server]     {scheme}://127.0.0.1:{port}")
+    if _tls_enabled:
+        fp = cert_fingerprint(_warehouse_dir) or ""
+        print(f"[server]     fp={fp}")
     print("=" * 60)
     return _server
 
 
 def stop_server():
-    global _server
+    global _server, _tls_enabled
     if _server is not None:
-        _server.shutdown()
+        try:
+            _server.shutdown()
+        except Exception:
+            pass
+        try:
+            _server.server_close()
+        except Exception:
+            pass
         _server = None
+    _tls_enabled = False

@@ -1,4 +1,7 @@
 import sqlite3
+import hashlib as _h
+import hmac as _hm
+import secrets as _secrets
 from datetime import datetime, timedelta
 
 
@@ -56,7 +59,7 @@ def ensure_managers(db_path):
     """Руководители склада (ПК-клиент управления).
 
     role: owner | admin | operator
-    Пароль хранится только как pass_hash (SHA-256 hex).
+    Пароль хранится только как pass_hash (PBKDF2-SHA256).
     """
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
@@ -340,6 +343,37 @@ def ensure_notifications(db_path):
     conn.close()
 
 
+def ensure_auth_sessions(db_path):
+    """Сессии аутентификации (opaque-токены).
+
+    token_hash = sha256(token). TTL 12 ч, продлевается при
+    каждом успешном запросе. При logout/смене пароля/regen_badge
+    запись удаляется.
+    """
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS auth_sessions (
+            token_hash TEXT PRIMARY KEY,
+            login TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            role TEXT DEFAULT '',
+            created_at TEXT,
+            expires_at TEXT,
+            last_seen_at TEXT,
+            ip TEXT DEFAULT ''
+        )
+    """)
+    _ensure_index(cur, "idx_auth_login",
+                  "CREATE INDEX idx_auth_login "
+                  "ON auth_sessions(login)")
+    _ensure_index(cur, "idx_auth_expires",
+                  "CREATE INDEX idx_auth_expires "
+                  "ON auth_sessions(expires_at)")
+    conn.commit()
+    conn.close()
+
+
 def run_all_migrations(db_path):
     """Инициализация схемы БД (без миграций).
     Программа выпускается как новая — старые склады
@@ -357,6 +391,7 @@ def run_all_migrations(db_path):
     ensure_tasks(db_path)
     ensure_reservations(db_path)
     ensure_notifications(db_path)
+    ensure_auth_sessions(db_path)
 
 
 # ==================================================================
@@ -488,3 +523,131 @@ def detect_mime(blob):
     if blob[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     return "image/png"
+
+
+# ==================================================================
+# Безопасность: пароли (PBKDF2-SHA256) и сессии
+# ==================================================================
+
+_PBKDF2_ITER = 600_000
+_PBKDF2_SALT = 16
+_SESSION_TTL_HOURS = 12
+
+
+def hash_password(password: str) -> str:
+    salt = _secrets.token_bytes(_PBKDF2_SALT)
+    digest = _h.pbkdf2_hmac(
+        "sha256", (password or "").encode("utf-8"), salt, _PBKDF2_ITER)
+    return (f"$pbkdf2-sha256${_PBKDF2_ITER}$"
+            f"{salt.hex()}${digest.hex()}")
+
+
+def verify_password(password: str, stored: str) -> bool:
+    if not stored:
+        return False
+    if stored.startswith("$pbkdf2-sha256$"):
+        try:
+            parts = stored.split("$")
+            iters = int(parts[2])
+            salt = bytes.fromhex(parts[3])
+            expected = bytes.fromhex(parts[4])
+            digest = _h.pbkdf2_hmac(
+                "sha256", (password or "").encode("utf-8"),
+                salt, iters)
+            return _hm.compare_digest(digest, expected)
+        except Exception:
+            return False
+    legacy = _h.sha256(
+        (password or "").encode("utf-8")).hexdigest()
+    return _hm.compare_digest(legacy, stored)
+
+
+def needs_rehash(stored: str) -> bool:
+    return not (stored or "").startswith("$pbkdf2-sha256$")
+
+
+def _token_hash(token: str) -> str:
+    return _h.sha256(token.encode("utf-8")).hexdigest()
+
+
+def create_auth_session(db_path, login, kind, role="", ip="",
+                        ttl_hours=_SESSION_TTL_HOURS):
+    token = _secrets.token_urlsafe(32)
+    now = datetime.now()
+    exp = now + timedelta(hours=ttl_hours)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO auth_sessions "
+            "(token_hash, login, kind, role, created_at, "
+            " expires_at, last_seen_at, ip) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (_token_hash(token), login, kind, role or "",
+             now.isoformat(), exp.isoformat(),
+             now.isoformat(), ip or ""))
+        conn.commit()
+    finally:
+        conn.close()
+    return token
+
+
+def verify_auth_session(db_path, token):
+    if not token:
+        return None
+    th = _token_hash(token)
+    now = datetime.now()
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT login, kind, role, expires_at "
+            "FROM auth_sessions WHERE token_hash=?", (th,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        try:
+            exp = datetime.fromisoformat(r[3])
+        except Exception:
+            exp = now - timedelta(seconds=1)
+        if exp < now:
+            cur.execute(
+                "DELETE FROM auth_sessions WHERE token_hash=?", (th,))
+            conn.commit()
+            return None
+        new_exp = now + timedelta(hours=_SESSION_TTL_HOURS)
+        cur.execute(
+            "UPDATE auth_sessions SET last_seen_at=?, expires_at=? "
+            "WHERE token_hash=?",
+            (now.isoformat(), new_exp.isoformat(), th))
+        conn.commit()
+        return {"login": r[0], "kind": r[1], "role": r[2] or ""}
+    finally:
+        conn.close()
+
+
+def invalidate_sessions(db_path, login=None, kind=None):
+    conn = sqlite3.connect(db_path)
+    try:
+        if login and kind:
+            conn.execute(
+                "DELETE FROM auth_sessions "
+                "WHERE login=? AND kind=?", (login, kind))
+        elif login:
+            conn.execute(
+                "DELETE FROM auth_sessions WHERE login=?", (login,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def invalidate_session_by_token(db_path, token):
+    if not token:
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "DELETE FROM auth_sessions WHERE token_hash=?",
+            (_token_hash(token),))
+        conn.commit()
+    finally:
+        conn.close()

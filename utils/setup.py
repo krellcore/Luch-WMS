@@ -2,19 +2,18 @@ import sys
 import os
 import json
 import sqlite3
-import hashlib
 import traceback
 from datetime import datetime
 from PySide6.QtWidgets import (
     QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QStackedWidget, QWidget,
     QFormLayout, QGroupBox, QMessageBox, QScrollArea, QFrame,
-    QProgressBar
+    QProgressBar, QCheckBox
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QIcon
 
-from db import run_all_migrations
+from db import run_all_migrations, hash_password
 from i18n import set_locale, tr
 
 
@@ -65,6 +64,7 @@ class SetupWizard(QDialog):
         self.params = {}
         self.db_path = None
         self.warehouse_dir = None
+        self.tls_fp = ""
 
         main_layout = QVBoxLayout(self)
         self.stack = QStackedWidget()
@@ -150,6 +150,22 @@ class SetupWizard(QDialog):
                   self.sections_edit)
         l1.addWidget(self.addr_group)
 
+        # ---------- TLS ----------
+        self.tls_checkbox = QCheckBox(tr(
+            "setup.wizard.tls_enable",
+            "Включить TLS (HTTPS) — рекомендуется"))
+        self.tls_checkbox.setChecked(True)
+        tls_hint = QLabel(tr(
+            "setup.wizard.tls_hint",
+            "Шифрует трафик между сервером и клиентами. "
+            "Для локальной сети настоятельно рекомендуется: "
+            "без TLS пароли и QR-пропуска передаются "
+            "в открытом виде."))
+        tls_hint.setWordWrap(True)
+        tls_hint.setStyleSheet("color:#7f8c8d; font-size:11px;")
+        l1.addWidget(self.tls_checkbox)
+        l1.addWidget(tls_hint)
+
         nav = QHBoxLayout()
         nav.addStretch()
         self.btn_next = QPushButton(
@@ -179,7 +195,7 @@ class SetupWizard(QDialog):
             "Создаётся один аккаунт владельца. Через него "
             "впоследствии можно будет добавлять других "
             "руководителей (admin/operator). Пароль хранится "
-            "только как SHA-256 хэш."))
+            "только как PBKDF2-SHA256 хэш."))
         owner_hint.setWordWrap(True)
         owner_hint.setStyleSheet("color:#7f8c8d;")
         ol.addWidget(owner_hint)
@@ -196,7 +212,7 @@ class SetupWizard(QDialog):
         self.owner_password_edit.setEchoMode(QLineEdit.Password)
         self.owner_password_edit.setPlaceholderText(tr(
             "setup.wizard.owner_password_placeholder",
-            "Пароль (мин. 4 символа)"))
+            "Пароль (мин. 8 символов)"))
         self.owner_password2_edit = QLineEdit()
         self.owner_password2_edit.setEchoMode(QLineEdit.Password)
         self.owner_password2_edit.setPlaceholderText(tr(
@@ -354,7 +370,6 @@ class SetupWizard(QDialog):
                 tr("setup.wizard.err.owner_login_required",
                    "Введите логин владельца."))
             return False
-        # '-' запрещён: формат токена <login>-<secret>.
         for ch in login:
             if not ((ch.isascii() and ch.isalnum()) or ch in "_."):
                 QMessageBox.warning(
@@ -363,12 +378,12 @@ class SetupWizard(QDialog):
                     tr("setup.wizard.err.owner_login_format",
                        "Логин: только латиница, цифры, _ и ."))
                 return False
-        if len(pwd) < 4:
+        if len(pwd) < 8:
             QMessageBox.warning(
                 self,
                 tr("common.error", "Ошибка"),
                 tr("setup.wizard.err.password_short",
-                   "Пароль должен содержать минимум 4 символа."))
+                   "Пароль должен содержать минимум 8 символов."))
             return False
         if pwd != pwd2:
             QMessageBox.warning(
@@ -388,9 +403,6 @@ class SetupWizard(QDialog):
     def _go_confirm(self):
         if not self._validate_owner():
             return
-        # FIX: обновить owner_login из поля перед показом сводки
-        # и созданием БД. Без этой строки self.params["owner_login"]
-        # остаётся пустым, и в managers вставляется пустой login.
         self.params["owner_login"] = \
             self.owner_login_edit.text().strip()
         self.confirm_label.setText("\n".join(self._summary()))
@@ -411,10 +423,12 @@ class SetupWizard(QDialog):
         p["rows"] = int(self.rows_edit.text().strip())
         p["sections"] = int(self.sections_edit.text().strip())
         p["owner_login"] = self.owner_login_edit.text().strip()
+        p["tls_enabled"] = (
+            "1" if self.tls_checkbox.isChecked() else "0")
 
     def _summary(self):
         p = self.params
-        return [
+        out = [
             tr("setup.wizard.summary.name",
                "Наименование: {name}", name=p['name']),
             tr("setup.wizard.summary.blocks",
@@ -428,6 +442,13 @@ class SetupWizard(QDialog):
             tr("setup.wizard.summary.owner",
                "Владелец: {login}", login=p['owner_login']),
         ]
+        if p.get("tls_enabled") == "1":
+            out.append(tr("setup.wizard.summary.tls",
+                          "TLS (HTTPS): включён"))
+        else:
+            out.append(tr("setup.wizard.summary.tls_off",
+                          "TLS (HTTPS): выключен"))
+        return out
 
     def _create(self):
         self.stack.setCurrentIndex(3)
@@ -435,13 +456,21 @@ class SetupWizard(QDialog):
         QApplication.processEvents()
         try:
             self._create_db()
+            if self.tls_fp:
+                self.result_label.setText(tr(
+                    "setup.wizard.result.folder_tls",
+                    "Папка склада: warehouses/{name}/\n\n"
+                    "TLS-сертификат создан. Fingerprint:\n{fp}",
+                    name=self.params['name'],
+                    fp=self.tls_fp))
+            else:
+                self.result_label.setText(tr(
+                    "setup.wizard.result.folder",
+                    "Папка склада: warehouses/{name}/",
+                    name=self.params['name']))
             self.status_label.setText(tr(
                 "setup.wizard.status.created",
                 "База данных успешно создана."))
-            self.result_label.setText(tr(
-                "setup.wizard.result.folder",
-                "Папка склада: warehouses/{name}/",
-                name=self.params['name']))
             self.btn_close.setEnabled(True)
         except Exception as e:
             tb = traceback.format_exc()
@@ -477,8 +506,6 @@ class SetupWizard(QDialog):
                 "Склад «{name}» уже существует.",
                 name=self.params['name']))
 
-        # Защита от пустого логина (на случай, если пользователь
-        # дошёл сюда в обход _go_confirm).
         if not self.params.get("owner_login"):
             raise RuntimeError(tr(
                 "setup.wizard.err.owner_login_empty",
@@ -509,8 +536,7 @@ class SetupWizard(QDialog):
         run_all_migrations(self.db_path)
 
         pwd = self.owner_password_edit.text()
-        pass_hash = hashlib.sha256(
-            pwd.encode("utf-8")).hexdigest()
+        pass_hash = hash_password(pwd)
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
         cur.execute("""
@@ -520,6 +546,21 @@ class SetupWizard(QDialog):
               datetime.now().isoformat()))
         conn.commit()
         conn.close()
+
+        # ---------- TLS ----------
+        if self.params.get("tls_enabled") == "1":
+            self.status_label.setText(tr(
+                "setup.wizard.status.tls",
+                "Генерация TLS-сертификата..."))
+            QApplication.processEvents()
+            try:
+                from tls import generate_cert
+                self.tls_fp = generate_cert(self.warehouse_dir)
+            except Exception as e:
+                raise RuntimeError(
+                    tr("setup.wizard.err.tls_failed",
+                       "Не удалось создать TLS-сертификат: "
+                       "{error}", error=str(e)))
 
         prefix_cell = self.params.get("prefix_cell", "")
         suffix_cell = self.params.get("suffix_cell", "")

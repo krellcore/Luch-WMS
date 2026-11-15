@@ -1,13 +1,15 @@
 """Базовый класс тонкой mgmt-страницы ПК-клиента управления.
 
-Реальный HTTP-клиент: по PAGE_KEY шлёт POST на /mgmt/page/{key}
-и рендерит ответ через MgmtRenderer. Один экземпляр на страницу.
+Реальный HTTP(S)-клиент: по PAGE_KEY шлёт POST на
+/mgmt/page/{key} и рендерит ответ через MgmtRenderer.
+Один экземпляр на страницу.
 
 Пример:
     page = MgmtPageBase(db_path, host, page_key="viewer")
 """
 
 import json
+import ssl
 import traceback
 import urllib.request
 import urllib.error
@@ -22,13 +24,15 @@ from mgmt_render import MgmtRenderer
 class MgmtPageBase(QWidget):
     PAGE_KEY = ""
 
-    def __init__(self, db_path, parent=None, page_key=None):
+    def __init__(self, db_path, parent=None, page_key=None,
+                 cert_path=None):
         super().__init__(parent)
         self.db_path = db_path
         self.host = parent
         if page_key:
             self.PAGE_KEY = page_key
         self._loaded = False
+        self._cert_path = cert_path
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -72,6 +76,19 @@ class MgmtPageBase(QWidget):
             return getattr(self.host, "locale", "ru") or "ru"
         return "ru"
 
+    def _ssl_ctx(self):
+        if not self._cert_path:
+            return None
+        try:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.load_verify_locations(cafile=self._cert_path)
+            return ctx
+        except Exception as e:
+            print(f"[mgmt_client_base] ssl ctx: {e}")
+            return None
+
     def _apply_locale_from(self, r):
         if not isinstance(r, dict) or self.host is None:
             return
@@ -108,6 +125,11 @@ class MgmtPageBase(QWidget):
                      "application/json; charset=utf-8"},
             method="POST",
         )
+        ctx = self._ssl_ctx()
+        if ctx is not None:
+            with urllib.request.urlopen(
+                    req, timeout=15, context=ctx) as resp:
+                return json.loads(resp.read().decode("utf-8"))
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
@@ -137,7 +159,6 @@ class MgmtPageBase(QWidget):
         try:
             r = self._post("/mgmt/page/" + self.PAGE_KEY, {})
         except urllib.error.HTTPError as e:
-            # HTTPError — подкласс URLError, ловим первым!
             self._handle_http_error(e)
             return
         except urllib.error.URLError as e:

@@ -4,8 +4,8 @@ import base64
 import json
 import sys
 import os
+import re
 import time
-import requests
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -28,6 +28,7 @@ from config import (
     load_config, save_config,
     get_ui_cache, set_ui_cache,
     get_settings_cache, set_settings_cache,
+    get_tls_cache,
 )
 
 
@@ -41,9 +42,7 @@ def _find_asset(name):
 
 
 # ================================================================
-# Встроенные fallback-переводы (ru/en).
-# Остальные языки приходят с сервера через /ui_config и кэшируются
-# в config.json.ui_cache[<server>].config.locales.
+# Встроенные fallback-переводы (ru/en) — без изменений.
 # ================================================================
 _T = {
     "ru": {
@@ -54,6 +53,7 @@ _T = {
         "login_emp_hint": "Поднесите QR сотрудника к сканеру",
         "user": "Пользователь: {fio}",
         "logout": "Выйти",
+        "logout_blocked_tooltip": "Сначала закройте задание/сессию",
         "sessions": "Сессии",
         "get_task": "Получить задание",
         "sessions_hint": "Сессии — это длинные процессы (например, приёмка). Задания берутся кнопкой выше.",
@@ -121,6 +121,7 @@ _T = {
         "err_not_server_qr": "Это не QR-код сервера:\n{code}",
         "err_not_employee_qr": "Это не QR сотрудника",
         "err_denied": "Доступ запрещён: {err}",
+        "err_tls_cert": "Ошибка сертификата: {err}",
         "common_error": "Ошибка",
         "sidebar_brand": "ЛУЧ",
         "sidebar_unauthorized": "Не авторизован",
@@ -128,6 +129,8 @@ _T = {
         "sidebar_menu_logout": "🚪  Выйти",
         "sidebar_menu_about": "ℹ  О программе",
         "about_text": "Луч — WMS для адресного хранения.",
+        "tls_badge": "🔒 HTTPS",
+        "http_badge": "⚠ HTTP (без шифрования)",
     },
     "en": {
         "title": "Luch — Terminal",
@@ -137,6 +140,7 @@ _T = {
         "login_emp_hint": "Present employee QR to scanner",
         "user": "User: {fio}",
         "logout": "Logout",
+        "logout_blocked_tooltip": "Close the task/session first",
         "sessions": "Sessions",
         "get_task": "Get task",
         "sessions_hint": "Sessions are long processes (e.g. receiving). Tasks are obtained via the button above.",
@@ -205,6 +209,7 @@ _T = {
         "err_not_server_qr": "Not a server QR:\n{code}",
         "err_not_employee_qr": "Not an employee QR",
         "err_denied": "Denied: {err}",
+        "err_tls_cert": "Certificate error: {err}",
         "common_error": "Error",
         "sidebar_brand": "LUCH",
         "sidebar_unauthorized": "Not logged in",
@@ -212,6 +217,8 @@ _T = {
         "sidebar_menu_logout": "🚪  Logout",
         "sidebar_menu_about": "ℹ  About",
         "about_text": "Luch — WMS for address storage.",
+        "tls_badge": "🔒 HTTPS",
+        "http_badge": "⚠ HTTP (insecure)",
     }
 }
 
@@ -222,11 +229,8 @@ _DEFAULT = "ru"
 
 
 def _read_cached_locales_all():
-    """Собрать все языки из конфига (ui_cache + legacy locales_cache)."""
     cfg = load_config()
     out = {}
-
-    # 1) Новый формат: ui_cache[<server>].config.locales
     ui_cache = cfg.get("ui_cache") or {}
     for entry in ui_cache.values():
         if not isinstance(entry, dict):
@@ -237,7 +241,6 @@ def _read_cached_locales_all():
             if code not in out:
                 out[code] = data
             else:
-                # мерж данных (более свежие — из ui_cache)
                 merged = dict(out[code].get("data") or {})
                 merged.update(data.get("data") or {})
                 out[code] = {
@@ -247,8 +250,6 @@ def _read_cached_locales_all():
                                 or out[code].get("fallback"),
                     "data": merged,
                 }
-
-    # 2) Legacy: locales_cache
     legacy = cfg.get("locales_cache") or {}
     if isinstance(legacy, dict):
         for code, entry in legacy.items():
@@ -264,17 +265,10 @@ def _read_cached_locales_all():
                     "fallback": entry.get("fallback"),
                     "data": data,
                 }
-
     return out
 
 
 def _apply_locales(server_locales):
-    """Мержит серверные языки во встроенные.
-
-    client.* — без префикса (клиентские тексты).
-    Всё остальное (plugin.<name>.*, task.*, common.*) — под полным
-    именем, чтобы плагины и роли могли переводиться.
-    """
     global _loaded
     for code, entry in server_locales.items():
         data = entry.get("data") or {}
@@ -380,17 +374,11 @@ def load_pixmap_from_data(data_str):
         except Exception:
             return None
         return None
-    try:
-        r = requests.get(data_str, timeout=4)
-        if r.status_code == 200 and pm.loadFromData(r.content):
-            return pm
-    except Exception:
-        pass
     return None
 
 
 # ================================================================
-# View-рендерер
+# View-рендерер — без изменений
 # ================================================================
 
 class ViewRenderer(QWidget):
@@ -736,10 +724,6 @@ class ViewRenderer(QWidget):
         return wrap
 
 
-# ================================================================
-# Уведомления
-# ================================================================
-
 class NotificationDialog(QDialog):
     def __init__(self, item: NotificationItem, parent=None):
         super().__init__(parent)
@@ -768,10 +752,6 @@ class NotificationDialog(QDialog):
         btns.accepted.connect(self.accept)
         v.addWidget(btns)
 
-
-# ================================================================
-# Диалог выбора языка
-# ================================================================
 
 class LanguageDialog(QDialog):
     def __init__(self, current_code: str, on_pick, parent=None):
@@ -824,9 +804,10 @@ class LanguageDialog(QDialog):
         self.accept()
 
 
-# ================================================================
-# Логин
-# ================================================================
+_QR_RE = re.compile(
+    r"^WMS://([^/:]+)(?::(\d+))?/?(\#fp=([^&\s]+))?$",
+    re.IGNORECASE)
+
 
 class LoginServerScreen(QWidget):
     done = Signal()
@@ -855,6 +836,12 @@ class LoginServerScreen(QWidget):
         self.prompt.setStyleSheet("color:#27ae60;")
         v.addWidget(self.prompt)
 
+        self.tls_badge = QLabel("")
+        self.tls_badge.setAlignment(Qt.AlignCenter)
+        self.tls_badge.setStyleSheet(
+            "color:#7f8c8d; font-size:11px;")
+        v.addWidget(self.tls_badge)
+
         self.hint_label = QLabel(tr("login_server_hint"))
         self.hint_label.setStyleSheet("color:#7f8c8d;")
         self.hint_label.setAlignment(Qt.AlignCenter)
@@ -868,23 +855,60 @@ class LoginServerScreen(QWidget):
         else:
             self.prompt.setText(tr("login_server_prompt"))
         self.hint_label.setText(tr("login_server_hint"))
+        self._update_tls_badge()
+
+    def _update_tls_badge(self):
+        if self.api.base.startswith("https://"):
+            self.tls_badge.setText(tr("tls_badge"))
+            self.tls_badge.setStyleSheet(
+                "color:#27ae60; font-size:11px; font-weight:bold;")
+        elif self.api.base.startswith("http://"):
+            self.tls_badge.setText(tr("http_badge"))
+            self.tls_badge.setStyleSheet(
+                "color:#e67e22; font-size:11px; font-weight:bold;")
+        else:
+            self.tls_badge.setText("")
 
     def handle_scan(self, code: str):
-        import re
-        m = re.match(r"^WMS://([^/:]+)(?::(\d+))?/?$",
-                     code.strip(), re.IGNORECASE)
+        m = _QR_RE.match(code.strip())
         if not m:
             QMessageBox.warning(
                 self, tr("common_error"),
                 tr("err_not_server_qr", code=code))
             return
+
         host = m.group(1)
         port = m.group(2) or "8765"
-        self.api.set_base(f"http://{host}:{port}")
+        fp = m.group(4)
+
         cfg = load_config()
-        cfg["server"] = self.api.base
+        https_url = f"https://{host}:{port}"
+        http_url = f"http://{host}:{port}"
+
+        if fp:
+            url = https_url
+        else:
+            if get_tls_cache(cfg, https_url):
+                url = https_url
+            else:
+                url = http_url
+
+        try:
+            self.api.set_base(url, fp=fp)
+        except ApiError as e:
+            QMessageBox.warning(
+                self, tr("common_error"),
+                tr("err_tls_cert", err=str(e)))
+            return
+        except Exception as e:
+            QMessageBox.warning(
+                self, tr("common_error"), str(e))
+            return
+
+        cfg["server"] = url
         save_config(cfg)
-        self.prompt.setText(f"{tr('server')} {self.api.base}")
+        self.prompt.setText(f"{tr('server')} {url}")
+        self._update_tls_badge()
         self.done.emit()
 
     def reset(self):
@@ -938,10 +962,6 @@ class LoginEmployeeScreen(QWidget):
         self.status.setText("")
         self.done.emit()
 
-
-# ================================================================
-# Экран режимов
-# ================================================================
 
 class ModesScreen(QWidget):
     session_started = Signal(str, str)
@@ -1043,10 +1063,6 @@ class ModesScreen(QWidget):
     def set_busy(self, busy):
         self.get_task_btn.setEnabled(not busy)
 
-
-# ================================================================
-# Экран сессии
-# ================================================================
 
 class SessionViewScreen(QWidget):
     closed = Signal()
@@ -1189,10 +1205,6 @@ class SessionViewScreen(QWidget):
         if hasattr(mw, "show_snackbar"):
             mw.show_snackbar(text)
 
-
-# ================================================================
-# Экран задания
-# ================================================================
 
 class TaskExecScreen(QWidget):
     closed = Signal()
@@ -1362,10 +1374,6 @@ class TaskExecScreen(QWidget):
             mw.show_snackbar(text)
 
 
-# ================================================================
-# Главное окно
-# ================================================================
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1387,11 +1395,10 @@ class MainWindow(QMainWindow):
         self._fio = "—"
         self._roles = []
 
-        # ui_config: какой сервер / версия / применён ли
         self._ui_version = ""
         self._ui_data = {}
         self._ui_applied = False
-        self._ui_applied_for = ""   # на какой api.base применён
+        self._ui_applied_for = ""
 
         self.hidden_input = QLineEdit(self)
         self.hidden_input.setFixedSize(1, 1)
@@ -1438,6 +1445,11 @@ class MainWindow(QMainWindow):
         self.session_view.connection_lost.connect(self._force_offline)
         self.task_exec.closed.connect(self._back_to_modes)
         self.task_exec.connection_lost.connect(self._force_offline)
+
+        # FIX: обновляем состояние кнопки «Выйти» в сайдбаре
+        # при каждом переключении экрана. Пока открыто задание
+        # или сессия — кнопка заблокирована.
+        self.stack.currentChanged.connect(self._update_logout_state)
 
         self.scanner = ScannerBridge(self, self.hidden_input)
         self.scanner.scanned.connect(self._dispatch_scan)
@@ -1489,23 +1501,48 @@ class MainWindow(QMainWindow):
 
         cfg = load_config()
         if cfg.get("server"):
-            self.api.set_base(cfg["server"])
+            saved_url = cfg["server"]
+            fp = None
+            try:
+                cached = get_tls_cache(cfg, saved_url)
+                if cached:
+                    fp = cached.get("fp") or None
+                self.api.set_base(saved_url, fp=fp)
+            except Exception as e:
+                print(f"[startup] set_base: {e}")
             self.login_server.prompt.setText(
                 f"{tr('server')} {self.api.base}")
+            self.login_server._update_tls_badge()
 
         self.stack.setCurrentIndex(0)
         self._apply_styles()
         self._refresh_sidebar_user()
+        self._update_logout_state()
 
-        # При старте: сначала применить кэш (мгновенно), потом
-        # проверить версию на сервере в фоне.
         self._apply_cached_ui()
         if self.api.base:
             QTimer.singleShot(200, self._sync_ui_config)
 
-    # ------------------------------------------------------------
-    # ui_config: кэш и синхронизация
-    # ------------------------------------------------------------
+    def _update_logout_state(self, _index=None):
+        """Блокирует «Выйти» в сайдбаре, пока открыто задание
+        или сессия.
+
+        Чтобы выйти, пользователь сначала закрывает задание
+        (кнопка «Выйти» на экране задания — отпускает задание)
+        или сессию (кнопка «Закрыть сессию»), а потом выходит.
+        """
+        if not hasattr(self, "sidebar_logout_btn"):
+            return
+        active_task = bool(getattr(self.task_exec, "task_id", 0))
+        active_session = bool(
+            getattr(self.session_view, "session_key", ""))
+        blocked = active_task or active_session
+        self.sidebar_logout_btn.setEnabled(not blocked)
+        if blocked:
+            self.sidebar_logout_btn.setToolTip(
+                tr("logout_blocked_tooltip"))
+        else:
+            self.sidebar_logout_btn.setToolTip("")
 
     def _apply_cached_ui(self):
         if not self.api.base:
@@ -1518,7 +1555,6 @@ class MainWindow(QMainWindow):
             self._ui_version = ver or ""
             self._apply_ui_config(config)
             return
-        # fallback — legacy: все языки из locales_cache
         cached = _read_cached_locales_all()
         if cached:
             _apply_locales(cached)
@@ -1534,13 +1570,6 @@ class MainWindow(QMainWindow):
         self._ui_applied_for = self.api.base
 
     def _sync_ui_config(self):
-        """Проверить версию ui_config на сервере, при изменении —
-        скачать полностью и закэшировать.
-
-        Вызывается ТОЛЬКО при подключении к серверу:
-          - старт приложения (если api.base известен);
-          - после скана QR сервера (_go_employee).
-        """
         if not self.api.base:
             return
         current_base = self.api.base
@@ -1555,7 +1584,6 @@ class MainWindow(QMainWindow):
         if version is None:
             self._apply_cached_ui()
             return
-        # сервер мог смениться, пока шёл запрос — не применяем
         if self.api.base != current_base:
             return
         if not changed:
@@ -1576,14 +1604,9 @@ class MainWindow(QMainWindow):
             return
         self._ui_version = ver or ""
         self._apply_ui_config(config)
-        # persist
         _cfg = load_config()
         set_ui_cache(_cfg, current_base, self._ui_version, config)
         save_config(_cfg)
-
-    # ------------------------------------------------------------
-    # Сайдбар
-    # ------------------------------------------------------------
 
     def _build_sidebar(self):
         sidebar = QFrame()
@@ -1665,6 +1688,7 @@ class MainWindow(QMainWindow):
         self.sidebar_logout_btn.setText(
             tr("sidebar_menu_logout"))
         self._refresh_sidebar_user()
+        self._update_logout_state()
 
     def _open_language_dialog(self):
         current = self.api.locale
@@ -1685,10 +1709,6 @@ class MainWindow(QMainWindow):
         self.session_view.retranslate()
         self.task_exec.retranslate()
 
-    # ------------------------------------------------------------
-    # Общее
-    # ------------------------------------------------------------
-
     def _force_offline(self):
         if not self.online:
             return
@@ -1699,10 +1719,6 @@ class MainWindow(QMainWindow):
         self._set_offline(True, tr("no_connection"))
 
     def _go_employee(self):
-        # Пользователь только что отсканировал QR сервера — это
-        # и есть "подключение к серверу". Здесь проверяем/подтягиваем
-        # ui_config. Блокирующе, но с коротким timeout (3–5 сек);
-        # на практике сервер уже доступен.
         self._sync_ui_config()
         self._retranslate_all()
         self._retranslate_sidebar()
@@ -1740,7 +1756,6 @@ class MainWindow(QMainWindow):
         self.modes.set_user(self._fio, self._roles)
         self._refresh_sidebar_user()
 
-        # Кэшируем /settings (с fallback на кэш).
         self._load_settings_with_cache()
 
         self._refresh_sessions()
@@ -1820,6 +1835,30 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.modes)
 
     def _logout(self):
+        # FIX: страховка. Если logout вызван при активном
+        # задании/сессии (например, программно или из modes при
+        # гонке) — сначала отпускаем задание и закрываем сессию,
+        # иначе задание зависнет в in_progress.
+        if getattr(self.task_exec, "task_id", 0):
+            try:
+                self.api.task_action(
+                    self.task_exec.task_id, "cancel", None, None,
+                    self.task_exec.current_meta.step_no
+                    if self.task_exec.current_meta else None)
+            except Exception:
+                pass
+            self.task_exec.task_id = 0
+            self.task_exec.current_meta = None
+            self.task_exec.current_nodes = []
+
+        if getattr(self.session_view, "session_key", ""):
+            try:
+                self.api.sessions_close(
+                    self.session_view.session_key, force=True)
+            except Exception:
+                pass
+            self.session_view.session_key = ""
+
         try:
             sessions = self.api.sessions_list()
             for s in sessions:
@@ -1827,6 +1866,10 @@ class MainWindow(QMainWindow):
                     self.api.sessions_close(s.key, force=True)
                 except Exception:
                     pass
+        except Exception:
+            pass
+        try:
+            self.api.logout()
         except Exception:
             pass
         self.api.token = None
@@ -1839,6 +1882,7 @@ class MainWindow(QMainWindow):
         self._set_offline(False)
         self.login_server.reset()
         self._refresh_sidebar_user()
+        self._update_logout_state()
         self.stack.setCurrentIndex(0)
 
     def _dispatch_scan(self, code):
@@ -1847,8 +1891,6 @@ class MainWindow(QMainWindow):
         w = self.stack.currentWidget()
         if w is self.login_server:
             self.login_server.handle_scan(code)
-            # Смена сервера — применить его кэш сразу (мгновенно),
-            # синхронизация версии идёт в _go_employee.
             self._ui_applied = False
             self._ui_applied_for = ""
             self._ui_version = ""
@@ -2000,6 +2042,10 @@ class MainWindow(QMainWindow):
             }
             QPushButton#sidebar_btn:pressed {
                 background-color: #1a252f;
+            }
+            QPushButton#sidebar_btn:disabled {
+                background: transparent;
+                color: #6b7a85;
             }
             QPushButton#primary_btn {
                 background-color: #27ae60; color: white;

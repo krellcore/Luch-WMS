@@ -1055,24 +1055,53 @@ private fun PdaScanHook(
 fun LoginServerScreen(vm: WmsViewModel) {
     val ctx = LocalContext.current
     var error by remember { mutableStateOf<String?>(null) }
+    var errorTls by remember { mutableStateOf(false) }
 
     fun process(url: String) {
         val p = Pattern.compile(
-            "^WMS://([^/:]+)(?::(\\d+))?/?$",
+            "^WMS://([^/:]+)(?::(\\d+))?/?(#fp=([^&\\s]+))?$",
             Pattern.CASE_INSENSITIVE
         )
         val m = p.matcher(url.trim())
         if (!m.matches()) {
             error = "Not a server QR"
+            errorTls = false
             return
         }
         val host = m.group(1)
         val port = m.group(2) ?: "8765"
-        val full = "http://$host:$port"
-        vm.setServer(full)
-        ctx.getSharedPreferences("wms", 0).edit()
-            .putString("server", full).apply()
-        vm.loadUiConfig(ctx)
+        val fp = m.group(4)   // может быть null
+
+        val httpsUrl = "https://$host:$port"
+        val httpUrl = "http://$host:$port"
+
+        // Выбор схемы:
+        // - fp в QR → HTTPS (сервер точно TLS)
+        // - нет fp, но есть сохранённый серт → HTTPS
+        // - иначе → HTTP (старый склад без TLS)
+        val certPrefs = ctx.getSharedPreferences(
+            "wms_certs", 0)
+        val useHttps = !fp.isNullOrBlank() ||
+                !certPrefs.getString(httpsUrl, null).isNullOrBlank()
+        val target = if (useHttps) httpsUrl else httpUrl
+
+        error = null
+        errorTls = false
+
+        vm.setServer(
+            url = target,
+            fp = fp,
+            onError = { msg ->
+                error = msg
+                errorTls = msg.contains("сертификат",
+                                         ignoreCase = true)
+            },
+            onOk = {
+                ctx.getSharedPreferences("wms", 0).edit()
+                    .putString("server", target).apply()
+                vm.loadUiConfig(ctx)
+            }
+        )
     }
 
     PdaScanHook(vm.deviceType) { url -> process(url) }
@@ -1103,8 +1132,12 @@ fun LoginServerScreen(vm: WmsViewModel) {
                 textAlign = TextAlign.Center)
             error?.let {
                 Spacer(Modifier.height(8.dp))
-                Text(it, color = MaterialTheme.colorScheme.error,
-                    textAlign = TextAlign.Center)
+                Text(it,
+                    color = if (errorTls)
+                        MaterialTheme.colorScheme.error
+                        else Color(0xFFE67E22),
+                    textAlign = TextAlign.Center,
+                    fontSize = 12.sp)
             }
         }
         UnifiedScanner(

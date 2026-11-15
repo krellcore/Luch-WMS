@@ -18,7 +18,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import java.net.URL
 
 
 typealias OnViewAction = (String, String?, String?) -> Unit
@@ -522,21 +521,23 @@ private fun RenderImage(node: ViewNode) {
 }
 
 
+/**
+ * Загружает Bitmap только из `data:` (SSRF-защита).
+ * Раньше поддерживались `http(s)://`-URL, что давало возможность
+ * плагину или MITM заставить клиент ходить по произвольным
+ * адресам (в т.ч. во внутреннюю сеть).
+ */
 private fun loadBitmap(url: String): android.graphics.Bitmap? {
     if (url.isBlank()) return null
-    try {
-        if (url.startsWith("data:")) {
-            val idx = url.indexOf(',')
-            if (idx < 0) return null
-            val b64 = url.substring(idx + 1)
-            val bytes = Base64.decode(b64, Base64.DEFAULT)
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        }
-        // http(s)
-        val stream = URL(url).openStream()
-        return BitmapFactory.decodeStream(stream)
+    if (!url.startsWith("data:")) return null
+    return try {
+        val idx = url.indexOf(',')
+        if (idx < 0) return null
+        val b64 = url.substring(idx + 1)
+        val bytes = Base64.decode(b64, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     } catch (_: Exception) {
-        return null
+        null
     }
 }
 

@@ -2,7 +2,6 @@
 
 import sqlite3
 import json
-import hashlib
 import secrets
 import base64
 import os
@@ -20,6 +19,7 @@ from mgmt_view_builder import build_sidebar
 from barcodes import make_qr_pixmap
 from i18n import tr
 from roles import list_roles
+from db import hash_password, invalidate_sessions
 
 
 BADGE_W, BADGE_H = 900, 600
@@ -32,10 +32,6 @@ def _role_label(key):
                 return tr(r["title_key"], r.get("title") or key)
             return r.get("title") or key
     return key
-
-
-def _hash(pwd):
-    return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
 
 
 def _doc(page, role):
@@ -252,8 +248,18 @@ def _build_list(db_path, role, search="", role_filter="",
                      children)
 
 
-def _build_add(db_path, role, error=None):
+def _build_add(db_path, role, error=None, values=None):
+    """Карточка «Новый сотрудник».
+
+    FIX: принимает values. Раньше при загрузке/удалении фото и
+    при ошибке валидации карточка перерисовывалась без values —
+    все введённые поля сбрасывались. Теперь значения сохраняются.
+    """
+    values = values or {}
     title = tr("employees.card.new", "Новый сотрудник")
+
+    def gv(k, default=""):
+        return values.get(k, default)
 
     children = [
         mgmt_header(title, [
@@ -310,33 +316,40 @@ def _build_add(db_path, role, error=None):
                 label=tr("employees.dialog.add.last_name",
                          "Фамилия*:"),
                 label_position="left", label_width=150,
-                stretch=True),
+                stretch=True,
+                value=gv("last_name", "")),
             mgmt_form_field(
                 "first_name", kind="text",
                 label=tr("employees.dialog.add.first_name",
                          "Имя*:"),
                 label_position="left", label_width=150,
-                stretch=True),
+                stretch=True,
+                value=gv("first_name", "")),
             mgmt_form_field(
                 "middle_name", kind="text",
                 label=tr("employees.dialog.add.middle_name",
                          "Отчество:"),
                 label_position="left", label_width=150,
-                stretch=True),
+                stretch=True,
+                value=gv("middle_name", "")),
             mgmt_form_field(
                 "login", kind="text",
                 label=tr("employees.dialog.add.login", "Логин*:"),
                 label_position="left", label_width=150,
-                stretch=True),
+                stretch=True,
+                value=gv("login", "")),
         ], title=tr("employees.card.main", "Основное")),
     ]
 
     role_fields = []
     for r in list_roles():
+        checked = values.get(
+            f"role_{r['key']}",
+            r["key"] == "picker")
         role_fields.append(mgmt_form_field(
             f"role_{r['key']}", kind="checkbox",
             label=_role_label(r["key"]),
-            value=(r["key"] == "picker")))
+            value=bool(checked)))
     right_col.append(card(
         role_fields,
         title=tr("employees.panel.roles_title",
@@ -376,7 +389,7 @@ def _build_panel(db_path, role, eid, message=None, error=None,
         role_list = []
 
     children = []
-    
+
     header_children = [
         button(tr("employees.btn.back", "← Назад"),
                "tap", "back"),
@@ -406,7 +419,7 @@ def _build_panel(db_path, role, eid, message=None, error=None,
             tr("employees.panel.no_photo", "НЕТ ФОТО"),
             "#34495e", "#95a5a6", "#3d566e")
         left_col.append(mgmt_image(ph_b64, width=240, height=300))
-    
+
     left_col.append(group([], orientation="vertical", stretch=True))
 
     right_col = []
@@ -546,17 +559,21 @@ def handle_action(action, action_id, value, login, role,
                 _set_temp_photo(db_path, blob)
             except Exception:
                 pass
+        # FIX: передаём values, чтобы поля формы не сбрасывались
+        # при загрузке фото.
         return {"ok": True,
                 "message": tr("employees.msg.photo_loaded",
                               "Фото загружено"),
-                "view": _doc(_build_add(db_path, role), role)}
+                "view": _doc(_build_add(
+                    db_path, role, values=values), role)}
 
     if action == "tap":
         if action_id == "photo_clear":
             _set_temp_photo(db_path, None)
+            # FIX: сохраняем значения полей.
             return {"ok": True, "view": _doc(
-                _build_add(db_path, role), role)}
-                
+                _build_add(db_path, role, values=values), role)}
+
         if action_id == "add_open":
             _set_temp_photo(db_path, None)
             return {"ok": True, "view": _doc(
@@ -654,8 +671,11 @@ def _add_commit(db_path, role, values):
     login_v = str(values.get("login") or "").strip()
 
     def _err(text_):
+        # FIX: передаём values, чтобы при ошибке валидации
+        # (логин занят / пустые поля) введённые данные не терялись.
         return {"ok": True, "view": _doc(
-            _build_add(db_path, role, error=text_), role)}
+            _build_add(db_path, role, error=text_,
+                       values=values), role)}
 
     if not last or not first or not login_v:
         return _err(tr("employees.err.fill_required",
@@ -676,7 +696,7 @@ def _add_commit(db_path, role, values):
             return _err(tr("employees.err.login_taken",
                            "логин занят"))
         secret = secrets.token_hex(8)
-        pass_hash = _hash(secret)
+        pass_hash = hash_password(secret)
         fio = " ".join([last, first] +
                        ([middle] if middle else []))
         photo = _get_temp_photo(db_path)
@@ -736,13 +756,21 @@ def _regen_badge(db_path, role, eid):
                              "не найден")), role)}
         first, last, middle, login_v, photo = r
         secret = secrets.token_hex(8)
-        pass_hash = _hash(secret)
+        pass_hash = hash_password(secret)
         cur.execute(
             "UPDATE employees SET pass_hash=? WHERE id=?",
             (pass_hash, eid))
         conn.commit()
     finally:
         conn.close()
+
+    # Инвалидировать активные сессии сотрудника: старый QR
+    # (login-secret) больше не действителен.
+    try:
+        invalidate_sessions(db_path, login_v, "employee")
+    except Exception:
+        pass
+
     fio = " ".join(p for p in [last or "", first or "",
                                middle or ""] if p)
     badge = _make_badge(fio, login_v, f"{login_v}-{secret}",

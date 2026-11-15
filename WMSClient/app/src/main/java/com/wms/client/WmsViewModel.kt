@@ -25,7 +25,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+
+
+private const val PREFS_MAIN = "wms"
+private const val PREFS_CERTS = "wms_certs"
 
 
 sealed class Screen {
@@ -129,7 +134,7 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
     private var taskWatchJob: Job? = null
 
     init {
-        val prefs = app.getSharedPreferences("wms", Context.MODE_PRIVATE)
+        val prefs = app.getSharedPreferences(PREFS_MAIN, Context.MODE_PRIVATE)
         Lang.init(app)
         availableLocales = Lang.availableLocales()
         val savedLoc = prefs.getString("locale", "ru") ?: "ru"
@@ -151,10 +156,23 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
             screen = Screen.LoginServer
         }
 
-        // Preload settings из кэша (если server сохранён).
         val savedServer = prefs.getString("server", "") ?: ""
         if (savedServer.isNotEmpty()) {
-            api.base = savedServer
+            val certPrefs = app.getSharedPreferences(
+                PREFS_CERTS, Context.MODE_PRIVATE)
+            val savedPem = certPrefs.getString(savedServer, null)
+            try {
+                if (savedServer.startsWith("https://")) {
+                    if (!savedPem.isNullOrBlank()) {
+                        api.setBase(savedServer, savedPem)
+                        serverUrl = savedServer
+                    }
+                } else {
+                    api.setBase(savedServer, null)
+                    serverUrl = savedServer
+                }
+            } catch (_: Exception) {}
+
             val cached = loadSettingsCache(app, savedServer)
             if (cached.isNotEmpty()) {
                 api.settings.clear()
@@ -179,7 +197,7 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         val safe = if (mode == "phone") "phone" else "pda"
         deviceType = safe
         getApplication<Application>()
-            .getSharedPreferences("wms", Context.MODE_PRIVATE)
+            .getSharedPreferences(PREFS_MAIN, Context.MODE_PRIVATE)
             .edit().putString("device_type", safe).apply()
         if (forcedChoice) {
             forcedChoice = false
@@ -205,22 +223,70 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         val safe = if (availableLocales.contains(loc)) loc else "ru"
         locale = safe
         api.locale = safe
-        getApplication<Application>().getSharedPreferences("wms", 0)
+        getApplication<Application>()
+            .getSharedPreferences(PREFS_MAIN, 0)
             .edit().putString("locale", safe).apply()
     }
 
-    fun setServer(url: String) {
-        api.base = url
-        serverUrl = url
-        screen = Screen.LoginEmployee
-        // Смена сервера = подключение к серверу: проверяем версию
-        // ui_config. Если недоступен — используем кэш.
-        loadUiConfigFromServer(getApplication())
-        // Preload settings под новый сервер.
-        val cached = loadSettingsCache(getApplication(), url)
-        if (cached.isNotEmpty()) {
-            api.settings.clear()
-            api.settings.putAll(cached)
+    /**
+     * Устанавливает сервер и, если нужно, выполняет TOFU.
+     *
+     * @param url базовый URL (http:// или https://)
+     * @param fp  fingerprint из QR (может быть null для HTTP)
+     * @param onError колбэк ошибки TLS (показывается в UI)
+     * @param onOk колбэк успеха (для MainActivity — перейти
+     *             к экрану логина сотрудника)
+     */
+    fun setServer(
+        url: String,
+        fp: String?,
+        onError: (String) -> Unit = {},
+        onOk: () -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            val ctx = getApplication<Application>()
+            val certPrefs = ctx.getSharedPreferences(
+                PREFS_CERTS, Context.MODE_PRIVATE)
+            val savedPem = certPrefs.getString(url, null)
+            try {
+                if (url.startsWith("https://")) {
+                    if (api.needsTofu(url, fp, savedPem)) {
+                        if (fp.isNullOrBlank()) {
+                            onError(
+                                "Сервер использует HTTPS, но в QR " +
+                                "нет fingerprint. Отсканируйте QR " +
+                                "со страницы «Задания» в ПК-клиенте " +
+                                "управления.")
+                            return@launch
+                        }
+                        val pem = withContext(Dispatchers.IO) {
+                            api.doTofu(url, fp)
+                        }
+                        certPrefs.edit().putString(url, pem).apply()
+                        api.setBase(url, pem)
+                    } else {
+                        api.setBase(url, savedPem)
+                    }
+                } else {
+                    api.setBase(url, null)
+                }
+
+                serverUrl = url
+                screen = Screen.LoginEmployee
+
+                val cached = loadSettingsCache(ctx, url)
+                if (cached.isNotEmpty()) {
+                    api.settings.clear()
+                    api.settings.putAll(cached)
+                }
+
+                loadUiConfigFromServer(ctx)
+                onOk()
+            } catch (e: ApiException) {
+                onError(e.message ?: "TLS error")
+            } catch (e: Exception) {
+                onError(e.message ?: "Network error")
+            }
         }
     }
 
@@ -242,7 +308,10 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun loadUiConfigFromServer(ctx: Context, localVersion: String = "") {
+    private fun loadUiConfigFromServer(
+        ctx: Context,
+        localVersion: String = ""
+    ) {
         viewModelScope.launch {
             val (serverVersion, changed) = withContext(Dispatchers.IO) {
                 try {
@@ -298,7 +367,6 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
                     onResult(false, msg)
                     return@launch
                 }
-                // Settings: пробуем сеть, при неудаче — кэш.
                 val ctx = getApplication<Application>()
                 val loadedOk = withContext(Dispatchers.IO) {
                     try { api.loadSettings(); true }
@@ -322,13 +390,12 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ----------------------------------------------------------------
-    // Кэш /settings (SharedPreferences "wms_settings", ключ = URL сервера)
-    // ----------------------------------------------------------------
-
-    private fun loadSettingsCache(ctx: Context, serverUrl: String): Map<String, String> {
+    private fun loadSettingsCache(
+        ctx: Context, serverUrl: String
+    ): Map<String, String> {
         if (serverUrl.isEmpty()) return emptyMap()
-        val prefs = ctx.getSharedPreferences("wms_settings", Context.MODE_PRIVATE)
+        val prefs = ctx.getSharedPreferences(
+            "wms_settings", Context.MODE_PRIVATE)
         val raw = prefs.getString(serverUrl, null) ?: return emptyMap()
         return try {
             val t = object : TypeToken<Map<String, String>>() {}.type
@@ -338,11 +405,16 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun saveSettingsCache(ctx: Context, serverUrl: String, settings: Map<String, String>) {
+    private fun saveSettingsCache(
+        ctx: Context, serverUrl: String,
+        settings: Map<String, String>
+    ) {
         if (serverUrl.isEmpty()) return
         try {
-            val prefs = ctx.getSharedPreferences("wms_settings", Context.MODE_PRIVATE)
-            prefs.edit().putString(serverUrl, Gson().toJson(settings)).apply()
+            val prefs = ctx.getSharedPreferences(
+                "wms_settings", Context.MODE_PRIVATE)
+            prefs.edit().putString(
+                serverUrl, Gson().toJson(settings)).apply()
         } catch (_: Exception) {}
     }
 
@@ -453,7 +525,9 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             busy = true
             try {
-                val env = withContext(Dispatchers.IO) { api.sessionsStart(key) }
+                val env = withContext(Dispatchers.IO) {
+                    api.sessionsStart(key)
+                }
                 currentSessionKey = key
                 currentSessionTitle = title
                 sessionNodes = env.nodes
@@ -531,10 +605,7 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
                 menuPageId = item.id
                 menuPageTitle = item.title
                 menuPageNodes = listOf(
-                    ViewNode(
-                        type = "text",
-                        value = item.content
-                    )
+                    ViewNode(type = "text", value = item.content)
                 )
                 menuPageLoading = false
                 screen = Screen.MenuPage
@@ -553,7 +624,9 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
     private fun fetchMenuPage(id: String) {
         viewModelScope.launch {
             try {
-                val env = withContext(Dispatchers.IO) { api.menuView(id) }
+                val env = withContext(Dispatchers.IO) {
+                    api.menuView(id)
+                }
                 menuPageNodes = env.nodes
             } catch (e: ApiException) {
                 if (e.isNetwork) {
@@ -613,13 +686,19 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         notifPoller?.stop()
         notifPoller = NotificationsPoller(
             scope = viewModelScope,
-            fetchFn = { withContext(Dispatchers.IO) { api.notificationsInbox() } },
+            fetchFn = {
+                withContext(Dispatchers.IO) {
+                    api.notificationsInbox()
+                }
+            },
             intervalMs = 10000L,
             onBatch = { items ->
                 if (items.isNotEmpty()) {
                     incomingNotifications = incomingNotifications + items
                     unreadCount += items.size
-                    if (activeNotification == null) activeNotification = items.first()
+                    if (activeNotification == null) {
+                        activeNotification = items.first()
+                    }
                 }
             }
         )
@@ -639,7 +718,9 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         unreadCount = (unreadCount - 1).coerceAtLeast(0)
         viewModelScope.launch {
             withContext(Dispatchers.IO) {
-                try { api.notificationsMarkRead(listOf(id)) } catch (_: Exception) {}
+                try {
+                    api.notificationsMarkRead(listOf(id))
+                } catch (_: Exception) {}
             }
         }
     }
@@ -655,7 +736,8 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
                 val st = withContext(Dispatchers.IO) {
                     try { api.taskStatus(tid) }
                     catch (_: Exception) {
-                        com.wms.client.api.TaskStatus(exists = true, status = "")
+                        com.wms.client.api.TaskStatus(
+                            exists = true, status = "")
                     }
                 }
                 if (!st.exists) {
@@ -668,7 +750,8 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
                     backToModes()
                     break
                 }
-                if (st.assigneeLogin.isNotEmpty() && myLogin.isNotEmpty() &&
+                if (st.assigneeLogin.isNotEmpty() &&
+                    myLogin.isNotEmpty() &&
                     st.assigneeLogin != myLogin) {
                     notify("Task transferred to another employee")
                     backToModes()
@@ -688,9 +771,13 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
                      else currentMeta.taskId.takeIf { it > 0 } ?: return
         viewModelScope.launch {
             try {
-                val env = withContext(Dispatchers.IO) { api.taskView(taskId) }
+                val env = withContext(Dispatchers.IO) {
+                    api.taskView(taskId)
+                }
                 applyTaskView(env.nodes, env.meta)
-                if (env.notFoundResult != null) lastNotFoundResult = env.notFoundResult
+                if (env.notFoundResult != null) {
+                    lastNotFoundResult = env.notFoundResult
+                }
                 if (env.meta.finished) transitionToDone()
             } catch (e: ApiException) {
                 if (e.isNetwork) {
@@ -710,7 +797,9 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         if (key.isEmpty()) return
         viewModelScope.launch {
             try {
-                val env = withContext(Dispatchers.IO) { api.sessionsStart(key) }
+                val env = withContext(Dispatchers.IO) {
+                    api.sessionsStart(key)
+                }
                 sessionNodes = env.nodes
             } catch (_: Exception) {}
         }
@@ -727,13 +816,16 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val env = withContext(Dispatchers.IO) {
                     api.taskAction(
-                        taskId = taskId, action = action, actionId = id,
-                        value = value, stepNo = currentMeta.stepNo
+                        taskId = taskId, action = action,
+                        actionId = id, value = value,
+                        stepNo = currentMeta.stepNo
                     )
                 }
                 applyTaskView(env.nodes, env.meta)
                 if (env.message.isNotEmpty()) notify(env.message)
-                if (env.notFoundResult != null) lastNotFoundResult = env.notFoundResult
+                if (env.notFoundResult != null) {
+                    lastNotFoundResult = env.notFoundResult
+                }
                 if (env.meta.finished) transitionToDone()
             } catch (e: ApiException) {
                 if (e.isNetwork) {
@@ -769,11 +861,7 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         currentNodes = emptyList()
         currentMeta = ViewMeta()
         screen = Screen.Done
-        viewModelScope.launch {
-            // settings уже актуальны; при переходе к Done повторно
-            // не запрашиваем — сессия считается завершённой.
-            loadModes()
-        }
+        viewModelScope.launch { loadModes() }
     }
 
     fun notify(msg: String) {
@@ -790,6 +878,14 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
+        try {
+            runBlocking {
+                withContext(Dispatchers.IO) {
+                    try { api.logout() } catch (_: Exception) {}
+                }
+            }
+        } catch (_: Exception) {}
+
         stopTaskWatch()
         stopHeartbeat()
         stopNotifications()

@@ -2,6 +2,8 @@
 import sys
 import os
 import json
+import sqlite3
+import ssl
 import time
 import urllib.request
 import urllib.error
@@ -84,6 +86,59 @@ def _fmt_bytes(n):
     return f"{size:.2f} {units[idx]}"
 
 
+def _detect_tls(wh_path):
+    """Читает settings.tls_enabled из warehouse.db склада.
+
+    Возвращает True, если сервер должен работать по HTTPS.
+    """
+    if not wh_path:
+        return False
+    db = os.path.join(wh_path, "warehouse.db")
+    if not os.path.isfile(db):
+        return False
+    try:
+        conn = sqlite3.connect(db)
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT value FROM settings WHERE key='tls_enabled'")
+        r = cur.fetchone()
+        conn.close()
+        return bool(r) and str(r[0]) == "1"
+    except Exception:
+        return False
+
+
+def _cert_path_for(wh_path):
+    """Путь к tls/cert.pem склада (или None)."""
+    if not wh_path:
+        return None
+    p = os.path.join(wh_path, "tls", "cert.pem")
+    return p if os.path.isfile(p) else None
+
+
+def _client_ssl_ctx(cert_path):
+    """SSLContext для клиента (только указанный серт).
+
+    Используется для:
+      - окна статуса (loopback, серт лежит в папке склада);
+      - запуска wms.py (лаунчер передаёт URL, wms.py сам
+        берёт серт из папки склада).
+
+    Возвращает None, если cert_path не задан (обычный HTTP).
+    """
+    if not cert_path or not os.path.isfile(cert_path):
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=cert_path)
+        return ctx
+    except Exception as e:
+        print(f"[main] ssl ctx: {e}")
+        return None
+
+
 class ServerStatusWindow(QWidget):
     """Окно статуса сервера.
 
@@ -91,7 +146,8 @@ class ServerStatusWindow(QWidget):
     не влияет на это окно до его пересоздания.
     """
 
-    def __init__(self, server_url, on_stop, parent=None):
+    def __init__(self, server_url, on_stop, parent=None,
+                 cert_path=None):
         super().__init__(parent)
         self._locale = current_locale()
         self.setWindowTitle(tr_in(self._locale,
@@ -101,6 +157,7 @@ class ServerStatusWindow(QWidget):
         self.server_url = server_url.rstrip("/")
         self._on_stop = on_stop
         self._stopped = False
+        self._ssl_ctx = _client_ssl_ctx(cert_path)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(20, 20, 20, 20)
@@ -222,8 +279,14 @@ class ServerStatusWindow(QWidget):
                          "application/json; charset=utf-8"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=3) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            if self._ssl_ctx is not None:
+                with urllib.request.urlopen(
+                        req, timeout=3,
+                        context=self._ssl_ctx) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            else:
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             if not self._stopped:
                 self.state_label.setText(
@@ -356,9 +419,6 @@ class MainWindow(QMainWindow):
         self.lang_label = QLabel(tr("app.language", "Язык:"))
         top_layout.addWidget(self.lang_label)
         self.lang_combo = QComboBox()
-        # FIX: языки берём из utils/i18n.py (он сканирует lang/*.json),
-        # а не хардкодим ru/en. Тогда de.json (и любой другой) видны
-        # сразу после установки файла и перезапуска лаунчера.
         for code in available_locales():
             self.lang_combo.addItem(locale_display_name(code), code)
         idx = self.lang_combo.findData(current_locale())
@@ -427,8 +487,6 @@ class MainWindow(QMainWindow):
 
     def _on_lang_changed(self, _index):
         code = self.lang_combo.currentData()
-        # FIX: не заворачивать любой язык в ru — принимать только
-        # те, что реально есть в lang/ (проверка по available_locales).
         if code not in available_locales():
             code = "ru"
         set_locale(code)
@@ -547,6 +605,19 @@ class MainWindow(QMainWindow):
             sys.executable, [server_script, wh_path])
         return True
 
+    def _server_url_for(self, wh_path):
+        """Определяет схему/URL и cert_path для склада.
+
+        https, если settings.tls_enabled=1 и серт существует.
+        Иначе http.
+        """
+        tls = _detect_tls(wh_path)
+        cert_path = _cert_path_for(wh_path) if tls else None
+        if tls and cert_path is None:
+            tls = False
+        scheme = "https" if tls else "http"
+        return f"{scheme}://127.0.0.1:8765", cert_path
+
     def open_warehouse_with_server(self, wh_path):
         if self._process_running(self._viewer_process):
             return
@@ -561,11 +632,13 @@ class MainWindow(QMainWindow):
             return
         if not self._start_server_process(wh_path):
             return
+        url, cert_path = self._server_url_for(wh_path)
         self._wait_for_server(
-            "http://127.0.0.1:8765",
+            url,
             lambda: self._on_server_ready(
-                wh_path, launch_client=True),
-            attempts=30)
+                wh_path, launch_client=True,
+                url=url, cert_path=cert_path),
+            attempts=30, cert_path=cert_path)
 
     def open_server_only(self, wh_path):
         if self._process_running(self._server_process):
@@ -579,28 +652,31 @@ class MainWindow(QMainWindow):
             return
         if not self._start_server_process(wh_path):
             return
+        url, cert_path = self._server_url_for(wh_path)
         self._wait_for_server(
-            "http://127.0.0.1:8765",
+            url,
             lambda: self._on_server_ready(
-                wh_path, launch_client=False),
-            attempts=30)
+                wh_path, launch_client=False,
+                url=url, cert_path=cert_path),
+            attempts=30, cert_path=cert_path)
 
-    def _on_server_ready(self, wh_path, launch_client):
-        self._open_status_window("http://127.0.0.1:8765")
+    def _on_server_ready(self, wh_path, launch_client,
+                         url, cert_path):
+        self._open_status_window(url, wh_path, cert_path)
         if launch_client:
-            self._launch_remote_client(
-                wh_path, "http://127.0.0.1:8765")
+            self._launch_remote_client(wh_path, url)
         else:
             self.hide()
 
-    def _open_status_window(self, url):
+    def _open_status_window(self, url, wh_path, cert_path=None):
         if self._status_window is not None:
             try:
                 self._status_window.close()
             except Exception:
                 pass
         self._status_window = ServerStatusWindow(
-            url, on_stop=self._stop_server_from_window)
+            url, on_stop=self._stop_server_from_window,
+            cert_path=cert_path)
         self._status_window.destroyed.connect(
             self._on_status_window_closed)
         self._status_window.show()
@@ -622,7 +698,8 @@ class MainWindow(QMainWindow):
         self._bring_to_front()
         self.update_list()
 
-    def _wait_for_server(self, url, callback, attempts=30):
+    def _wait_for_server(self, url, callback, attempts=30,
+                         cert_path=None):
         try:
             req = urllib.request.Request(url + "/ping",
                                           data=b"{}",
@@ -630,8 +707,14 @@ class MainWindow(QMainWindow):
                                           headers={
                                               "Content-Type":
                                               "application/json"})
-            with urllib.request.urlopen(req, timeout=1) as resp:
-                resp.read()
+            ctx = _client_ssl_ctx(cert_path)
+            if ctx is not None:
+                with urllib.request.urlopen(
+                        req, timeout=1, context=ctx) as resp:
+                    resp.read()
+            else:
+                with urllib.request.urlopen(req, timeout=1) as resp:
+                    resp.read()
             callback()
             return
         except Exception:
@@ -652,7 +735,7 @@ class MainWindow(QMainWindow):
             return
         QTimer.singleShot(
             300, lambda: self._wait_for_server(
-                url, callback, attempts - 1))
+                url, callback, attempts - 1, cert_path))
 
     def _launch_remote_client(self, wh_path, url):
         viewer_script = os.path.join(_HERE, "utils", "wms.py")
@@ -665,10 +748,11 @@ class MainWindow(QMainWindow):
         self._viewer_process.finished.connect(self.on_viewer_finished)
         self._viewer_process.errorOccurred.connect(
             self.on_viewer_error)
-        self._viewer_process.start(
-            sys.executable,
-            [viewer_script, "--server", url, wh_path,
-             "--locale", current_locale()])
+        args = [viewer_script, "--server", url, wh_path,
+                "--locale", current_locale()]
+        if url.startswith("https://"):
+            args.append("--tls")
+        self._viewer_process.start(sys.executable, args)
         self.hide()
 
     def open_remote_client(self, wh_path=None):
@@ -694,7 +778,11 @@ class MainWindow(QMainWindow):
             self.on_viewer_error)
         args = [viewer_script, "--server", default_url,
                 "--locale", current_locale()]
-        if wh_path:
+        if default_url.startswith("https://"):
+            args.append("--tls")
+            if wh_path:
+                args.append(wh_path)
+        elif wh_path:
             args.append(wh_path)
         self._viewer_process.start(sys.executable, args)
         self.hide()

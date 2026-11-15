@@ -15,9 +15,10 @@ if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
 
 from PySide6.QtGui import QGuiApplication
 
-from db import run_all_migrations
+from db import run_all_migrations, read_settings
 from plugins import PluginManager
 from server import start_server, set_host, stop_server
+from tls import has_cert, generate_cert
 
 
 def _configure_stdio():
@@ -107,6 +108,31 @@ class HeadlessHost:
         ]
 
 
+def _resolve_tls(warehouse_dir, force_tls):
+    """Определяет, включать ли TLS.
+
+    force_tls=True  — всегда.
+    force_tls=False — читаем settings.tls_enabled ("1" → True).
+    Если включено, но серта нет — генерируем.
+    """
+    if force_tls:
+        enabled = True
+    else:
+        s = read_settings(
+            os.path.join(warehouse_dir, "warehouse.db")) or {}
+        enabled = str(s.get("tls_enabled") or "0") == "1"
+    if enabled and not has_cert(warehouse_dir):
+        print("[headless] TLS: сертификат не найден — генерирую")
+        try:
+            fp = generate_cert(warehouse_dir)
+            print(f"[headless] TLS fp: {fp}")
+        except Exception as e:
+            print(f"[headless] TLS: не удалось создать сертификат: {e}")
+            print("[headless] стартуем без TLS")
+            return False
+    return enabled
+
+
 def main():
     _configure_stdio()
 
@@ -120,6 +146,8 @@ def main():
                         help="Адрес (по умолчанию 0.0.0.0)")
     parser.add_argument("--safe", action="store_true",
                         help="Safe mode: без плагинов")
+    parser.add_argument("--tls", action="store_true",
+                        help="Включить TLS (HTTPS) принудительно")
     args = parser.parse_args()
 
     wh_path = args.warehouse_folder
@@ -138,6 +166,8 @@ def main():
 
     run_all_migrations(db_path)
 
+    tls_enabled = _resolve_tls(wh_path, args.tls)
+
     host = HeadlessHost(db_path, safe_mode=args.safe)
 
     if not args.safe:
@@ -155,7 +185,8 @@ def main():
         print("[headless] SAFE MODE: плагины не активируются")
 
     try:
-        start_server(db_path, host=args.host, port=args.port)
+        start_server(db_path, host=args.host, port=args.port,
+                     tls=tls_enabled)
     except Exception as e:
         print(f"[headless] сервер не запущен: {e}")
         sys.exit(1)

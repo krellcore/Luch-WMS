@@ -18,6 +18,7 @@
 import os
 import re
 import sys
+import ast
 import json
 import importlib.util
 import sqlite3
@@ -113,16 +114,53 @@ class PluginManager:
         return info
 
     def _peek_flat_file(self, path):
+        """Читает PLUGIN_INFO без исполнения кода.
+
+        Раньше файл импортировался (exec_module) уже на scan() —
+        любой legacy .py исполнялся при открытии страницы
+        «Плагины». Теперь парсим AST и берём только литерал
+        PLUGIN_INFO.
+        """
         try:
-            mod_name = ("_peek_"
-                        + os.path.splitext(os.path.basename(path))[0])
-            spec = importlib.util.spec_from_file_location(mod_name, path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return getattr(mod, "PLUGIN_INFO", None)
+            with open(path, encoding="utf-8") as f:
+                src = f.read()
+            tree = ast.parse(src, filename=path)
         except Exception as e:
             print(f"[plugins] peek failed for {path}: {e}")
             return None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and \
+                            target.id == "PLUGIN_INFO":
+                        try:
+                            info = ast.literal_eval(node.value)
+                            if isinstance(info, dict):
+                                return info
+                        except Exception:
+                            return None
+        return None
+
+    def _safe_entry(self, folder, entry):
+        """Возвращает безопасный абсолютный путь к entry.
+
+        Запрещает абсолютные пути и `..` — плагин не должен
+        выходить за пределы своей папки.
+        """
+        if not entry:
+            entry = "plugin.py"
+        entry = str(entry).replace("\\", "/")
+        parts = entry.split("/")
+        if os.path.isabs(entry) or ".." in parts:
+            raise RuntimeError(
+                f"недопустимый entry в plugin.json: {entry}")
+        folder_abs = os.path.abspath(folder)
+        full = os.path.abspath(os.path.join(folder_abs, entry))
+        if not (full == folder_abs or
+                full.startswith(folder_abs + os.sep)):
+            raise RuntimeError(
+                f"entry выходит за пределы папки плагина: {entry}")
+        return full
 
     def get_active(self):
         try:
@@ -188,7 +226,6 @@ class PluginManager:
             raise RuntimeError(f"Плагин {name} не найден")
         entry = found[name]
         info = entry["info"]
-        entry_path = entry["entry_path"]
         folder = entry["folder"]
 
         api_req = info.get("api_version")
@@ -197,6 +234,12 @@ class PluginManager:
                 f"Плагин требует API {api_req}, "
                 f"ядро предоставляет {API_VERSION}"
             )
+
+        if folder:
+            entry_path = self._safe_entry(
+                folder, info.get("entry") or "plugin.py")
+        else:
+            entry_path = entry["entry_path"]
 
         if not os.path.isfile(entry_path):
             raise RuntimeError(

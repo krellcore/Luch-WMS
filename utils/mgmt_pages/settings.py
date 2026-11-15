@@ -1,5 +1,7 @@
 """«Настройки склада» — серверная сборка view и handler действий."""
 
+import json
+import os
 import sqlite3
 
 from mgmt_protocol import (
@@ -24,6 +26,17 @@ _UI_DEFAULTS = {
     "ui_sec_from": 1,
     "ui_sec_to": 1,
 }
+
+# Лимит на одну операцию создания диапазона: отсекает DoS
+# «10^9 ячеек одним запросом», но пропускает реальные склады
+# (5 этажей × 50 рядов × 50 секций × 40 ячеек = 500 000).
+_MAX_RANGE_CELLS = 2_000_000
+# Коммит каждые N ячеек — чтобы при сбое не терять уже вставленное.
+_RANGE_COMMIT_CHUNK = 25_000
+# Выше этого порога — диалог подтверждения.
+_RANGE_CONFIRM_THRESHOLD = 50_000
+# Выше этого порога — подсказка «создавайте по этажам».
+_RANGE_SPLIT_HINT_THRESHOLD = 200_000
 
 
 def _format_block_name(name):
@@ -108,13 +121,6 @@ def _alert_dialog(title, msg, dialog_id="alert"):
 
 
 def _language_options():
-    """Опции для селекта языка.
-
-    Формат label:
-      "Русский (ru, 340/340)"
-      "Deutsch (de, 312/340, fallback: ru)"
-      "العربية (ar, 340/340, RTL)"
-    """
     opts = []
     for code in available_locales():
         info = locale_info(code)
@@ -132,7 +138,6 @@ def _language_options():
 
 
 def _language_info_card():
-    """Карточка характеристик выбранного языка."""
     code = current_locale()
     info = locale_info(code)
     total = info["total"] or info["translated"] or 0
@@ -173,6 +178,195 @@ def _language_info_card():
                          "Характеристики языка"))
 
 
+def _range_confirm_dialog(total_cells):
+    children = [
+        text(tr(
+            "settings.range_confirm.text",
+            "Будет создано {total} ячеек. Это может занять "
+            "несколько секунд, в течение которых сервер будет "
+            "занят — другие клиенты могут ждать.",
+            total=total_cells)),
+    ]
+    if total_cells > _RANGE_SPLIT_HINT_THRESHOLD:
+        children.append(caption(tr(
+            "settings.range_confirm.hint",
+            "Рекомендуем создавать по этажам: укажите "
+            "«Этаж от = Этаж до» для одного этажа, затем "
+            "повторите для следующего. Так сервер будет "
+            "свободен между операциями.")))
+    return mgmt_dialog(
+        "range_confirm",
+        tr("settings.range_confirm.title",
+           "Подтверждение создания"),
+        children,
+        buttons=[
+            button(tr("settings.range_confirm.yes", "Продолжить"),
+                   "tap", "range_confirm_yes", style="primary"),
+            button(tr("settings.range_confirm.no", "Отмена"),
+                   "tap", "range_confirm_no"),
+        ],
+    )
+
+
+def _save_range_pending(db_path, login, values, total_cells):
+    key = f"_mgmt_range_pending_{login}"
+    payload = json.dumps(
+        {"values": values, "total_cells": int(total_cells)},
+        ensure_ascii=False)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM settings WHERE key=?", (key,))
+        if cur.fetchone():
+            cur.execute("UPDATE settings SET value=? WHERE key=?",
+                        (payload, key))
+        else:
+            cur.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?)",
+                (key, payload))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _load_range_pending(db_path, login):
+    key = f"_mgmt_range_pending_{login}"
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+        r = cur.fetchone()
+        if r and r[0]:
+            try:
+                return json.loads(r[0])
+            except Exception:
+                return None
+        return None
+    finally:
+        conn.close()
+
+
+def _drop_range_pending(db_path, login):
+    key = f"_mgmt_range_pending_{login}"
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("DELETE FROM settings WHERE key=?", (key,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _security_card(db_path):
+    """Карточка «Безопасность»: TLS, fingerprint, перевыпуск.
+
+    Читает settings.tls_enabled и файлы сертификата. Кнопка
+    «Перевыпустить» показывает диалог подтверждения (файлы
+    перезапишутся, старый серт — в cert.pem.old).
+    """
+    warehouse_dir = os.path.dirname(os.path.abspath(db_path))
+    conn = sqlite3.connect(db_path)
+    try:
+        s = _read_settings(conn)
+    finally:
+        conn.close()
+
+    enabled = str(s.get("tls_enabled") or "0") == "1"
+
+    try:
+        from tls import has_cert, cert_fingerprint
+        has = has_cert(warehouse_dir)
+        fp = cert_fingerprint(warehouse_dir) if has else ""
+    except Exception:
+        has = False
+        fp = ""
+
+    if has:
+        status_text = tr(
+            "settings.security.status_ok",
+            "Сертификат: установлен")
+        status_accent = "success"
+    else:
+        status_text = tr(
+            "settings.security.status_missing",
+            "Сертификат: отсутствует")
+        status_accent = "warning"
+
+    if enabled:
+        mode_text = tr(
+            "settings.security.mode_on", "Режим: HTTPS (TLS)")
+        mode_accent = "success"
+    else:
+        mode_text = tr(
+            "settings.security.mode_off", "Режим: HTTP")
+        mode_accent = "warning"
+
+    children = [
+        group([
+            mgmt_badge(mode_text, accent=mode_accent),
+            mgmt_badge(status_text, accent=status_accent),
+        ], orientation="horizontal", spacing=8),
+        caption(tr(
+            "settings.security.fp_label",
+            "Fingerprint (для QR):")),
+        text(fp or "—",
+             bold=True, size=11),
+        spacer(8),
+        caption(tr(
+            "settings.security.restart_hint",
+            "Включение/выключение TLS и перевыпуск "
+            "сертификата требуют перезапуска сервера. "
+            "После изменения перезапустите сервер вручную "
+            "(остановить в окне статуса и запустить заново).")),
+        spacer(8),
+    ]
+
+    tls_field = mgmt_form_field(
+        "tls_enabled", kind="checkbox",
+        label=tr("settings.security.tls_label",
+                 "Использовать TLS (HTTPS)"),
+        value=enabled,
+        on_change="input_submit")
+
+    regen_btn = button(
+        tr("settings.security.regen_btn",
+           "Перевыпустить сертификат"),
+        "tap", "regen_tls_confirm",
+        enabled=has,
+        style="default")
+
+    children.append(tls_field)
+    children.append(mgmt_toolbar([regen_btn]))
+
+    return card(children,
+                title=tr("settings.security.title",
+                         "Безопасность"))
+
+
+def _regen_tls_confirm_dialog():
+    return mgmt_dialog(
+        "regen_tls_confirm",
+        tr("settings.security.regen_confirm_title",
+           "Перевыпустить сертификат"),
+        [
+            text(tr(
+                "settings.security.regen_confirm_text",
+                "Будет создан новый самоподписанный "
+                "сертификат. Старый сохранится как "
+                "cert.pem.old (30 дней). Все клиенты должны "
+                "будут отсканировать новый QR с новым "
+                "fingerprint. Перезапустите сервер после "
+                "перевыпуска.")),
+        ],
+        buttons=[
+            button(tr("settings.security.regen_yes",
+                      "Перевыпустить"),
+                   "tap", "regen_tls_apply", style="primary"),
+            button(tr("settings.security.regen_no", "Отмена"),
+                   "tap", "close_dialog"),
+        ],
+    )
+
+
 def _build(db_path, role, *, dialog=None, alert_dialog=None,
            ui_overrides=None):
     conn = sqlite3.connect(db_path)
@@ -208,6 +402,9 @@ def _build(db_path, role, *, dialog=None, alert_dialog=None,
                 "Язык интерфейса")))
 
     children.append(_language_info_card())
+
+    # --- Безопасность ---
+    children.append(_security_card(db_path))
 
     # --- Блоки склада ---
     blocks_options = [
@@ -324,6 +521,13 @@ def _build(db_path, role, *, dialog=None, alert_dialog=None,
 
     if dialog == "add_block":
         children.append(_build_add_block_dialog(free_numbers))
+    elif dialog == "regen_tls_confirm":
+        children.append(_regen_tls_confirm_dialog())
+    elif isinstance(dialog, dict):
+        kind = dialog.get("kind")
+        if kind == "range_confirm":
+            children.append(_range_confirm_dialog(
+                int(dialog.get("total_cells") or 0)))
 
     if alert_dialog:
         children.append(alert_dialog)
@@ -406,6 +610,22 @@ def handle_action(action, action_id, value, login, role,
                               "Список языков перечитан"),
                 "view": _build(db_path, role)}
 
+    if action == "input_submit" and action_id == "tls_enabled":
+        new_val = "1" if value else "0"
+        conn = sqlite3.connect(db_path)
+        try:
+            _save_setting(conn, "tls_enabled", new_val)
+        finally:
+            conn.close()
+        msg = tr(
+            "settings.msg.tls_changed",
+            "Настройка TLS сохранена. Перезапустите сервер, "
+            "чтобы изменения вступили в силу.")
+        return {"ok": True, "view": _build(
+            db_path, role,
+            alert_dialog=_alert_dialog(
+                tr("common.info", "Готово"), msg))}
+
     if action == "input_submit" and action_id == "shelves_count":
         try:
             n = int(value or 1)
@@ -440,13 +660,52 @@ def handle_action(action, action_id, value, login, role,
         if action_id == "delete_block":
             return _delete_block(db_path, role, values)
         if action_id == "create_range":
-            return _create_range(db_path, role, values)
+            return _create_range_start(db_path, role, login, values)
+        if action_id == "range_confirm_yes":
+            return _range_confirm_apply(db_path, role, login)
+        if action_id == "range_confirm_no":
+            _drop_range_pending(db_path, login)
+            return {"ok": True, "view": _build(db_path, role)}
         if action_id == "delete_range":
             return _delete_range(db_path, role, values)
+        if action_id == "regen_tls_confirm":
+            return {"ok": True, "view": _build(
+                db_path, role, dialog="regen_tls_confirm")}
+        if action_id == "regen_tls_apply":
+            return _regen_tls_apply(db_path, role)
 
     return {"ok": False,
             "error": tr("settings.err.unknown_action",
                         "unknown action: {id}", id=action_id)}
+
+
+def _regen_tls_apply(db_path, role):
+    warehouse_dir = os.path.dirname(os.path.abspath(db_path))
+    try:
+        from tls import generate_cert
+        import shutil
+        cert_path = os.path.join(warehouse_dir, "tls", "cert.pem")
+        old_path = cert_path + ".old"
+        if os.path.isfile(cert_path):
+            try:
+                shutil.copy2(cert_path, old_path)
+            except Exception:
+                pass
+        fp = generate_cert(warehouse_dir)
+    except Exception as e:
+        return _err_view(db_path, role, tr(
+            "settings.security.regen_failed",
+            "Не удалось перевыпустить сертификат: {error}",
+            error=str(e)))
+    msg = tr(
+        "settings.security.regen_done",
+        "Сертификат перевыпущен. Новый fingerprint: {fp}. "
+        "Перезапустите сервер, чтобы он начал использовать "
+        "новый сертификат.", fp=fp)
+    return {"ok": True, "view": _build(
+        db_path, role,
+        alert_dialog=_alert_dialog(
+            tr("common.info", "Готово"), msg))}
 
 
 def _persist_range_settings(db_path, values):
@@ -545,16 +804,14 @@ def _delete_block(db_path, role, values):
                        "Блок удалён.")))}
 
 
-def _create_range(db_path, role, values):
-    bid = values.get("block_id")
-    if bid is None:
-        return {"ok": True,
-                "view": _build(
-                    db_path, role,
-                    alert_dialog=_alert_dialog(
-                        tr("common.error", "Ошибка"),
-                        tr("settings.err.no_block",
-                           "Выберите блок.")))}
+def _err_view(db_path, role, msg):
+    return {"ok": True, "view": _build(
+        db_path, role,
+        alert_dialog=_alert_dialog(
+            tr("common.error", "Ошибка"), msg))}
+
+
+def _validate_range_values(values, with_shelves=False):
     try:
         ff = int(values.get("floor_from") or 1)
         ft = int(values.get("floor_to") or 1)
@@ -562,37 +819,132 @@ def _create_range(db_path, role, values):
         rt = int(values.get("row_to") or 1)
         sf = int(values.get("sec_from") or 1)
         st = int(values.get("sec_to") or 1)
-        shelves_count = int(values.get("shelves_count") or 1)
     except (ValueError, TypeError):
-        return {"ok": True,
-                "view": _build(
-                    db_path, role,
-                    alert_dialog=_alert_dialog(
-                        tr("common.error", "Ошибка"),
-                        tr("settings.err.numeric",
-                           "Проверьте числовые поля.")))}
+        return False, None, tr(
+            "settings.err.numeric",
+            "Проверьте числовые поля.")
 
+    if not (1 <= ff <= 9 and 1 <= ft <= 9):
+        return False, None, tr(
+            "settings.err.floor_range",
+            "Этаж «от» > «до».")
+    if not (1 <= rf <= 99 and 1 <= rt <= 99):
+        return False, None, tr(
+            "settings.err.row_range",
+            "Ряд «от» > «до».")
+    if not (1 <= sf <= 99 and 1 <= st <= 99):
+        return False, None, tr(
+            "settings.err.section_range",
+            "Секция «от» > «до».")
     if ff > ft:
-        return {"ok": True, "view": _build(
-            db_path, role,
-            alert_dialog=_alert_dialog(
-                tr("common.error", "Ошибка"),
-                tr("settings.err.floor_range",
-                   "Этаж «от» > «до».")))}
+        return False, None, tr(
+            "settings.err.floor_range",
+            "Этаж «от» > «до».")
     if rf > rt:
-        return {"ok": True, "view": _build(
-            db_path, role,
-            alert_dialog=_alert_dialog(
-                tr("common.error", "Ошибка"),
-                tr("settings.err.row_range",
-                   "Ряд «от» > «до».")))}
+        return False, None, tr(
+            "settings.err.row_range",
+            "Ряд «от» > «до».")
     if sf > st:
+        return False, None, tr(
+            "settings.err.section_range",
+            "Секция «от» > «до».")
+
+    parsed = {"ff": ff, "ft": ft,
+              "rf": rf, "rt": rt,
+              "sf": sf, "st": st}
+
+    if with_shelves:
+        try:
+            shelves_count = int(values.get("shelves_count") or 1)
+        except (ValueError, TypeError):
+            return False, None, tr(
+                "settings.err.numeric",
+                "Проверьте числовые поля.")
+        if not (1 <= shelves_count <= 26):
+            return False, None, tr(
+                "settings.err.numeric",
+                "Проверьте числовые поля.")
+
+        per_shelf = []
+        for i in range(shelves_count):
+            try:
+                per = int(values.get(f"shelf_{i}") or 1)
+            except (ValueError, TypeError):
+                return False, None, tr(
+                    "settings.err.numeric",
+                    "Проверьте числовые поля.")
+            if not (1 <= per <= 99):
+                return False, None, tr(
+                    "settings.err.numeric",
+                    "Проверьте числовые поля.")
+            per_shelf.append(per)
+
+        total_cells = ((ft - ff + 1) * (rt - rf + 1) *
+                       (st - sf + 1) * sum(per_shelf))
+        if total_cells > _MAX_RANGE_CELLS:
+            return False, None, tr(
+                "settings.err.range_too_big",
+                "Слишком большой диапазон ({total} ячеек). "
+                "Максимум {limit} за раз. Разбейте на "
+                "несколько диапазонов (например, по этажам).",
+                total=total_cells, limit=_MAX_RANGE_CELLS)
+        parsed["shelves_count"] = shelves_count
+        parsed["per_shelf"] = per_shelf
+        parsed["total_cells"] = total_cells
+
+    return True, parsed, None
+
+
+def _create_range_start(db_path, role, login, values):
+    bid = values.get("block_id")
+    if bid is None:
+        return _err_view(db_path, role, tr(
+            "settings.err.no_block", "Выберите блок."))
+
+    ok, parsed, err = _validate_range_values(
+        values, with_shelves=True)
+    if not ok:
+        return _err_view(db_path, role, err)
+
+    total_cells = parsed["total_cells"]
+
+    if total_cells > _RANGE_CONFIRM_THRESHOLD:
+        _save_range_pending(db_path, login, values, total_cells)
         return {"ok": True, "view": _build(
             db_path, role,
-            alert_dialog=_alert_dialog(
-                tr("common.error", "Ошибка"),
-                tr("settings.err.section_range",
-                   "Секция «от» > «до».")))}
+            dialog={"kind": "range_confirm",
+                    "total_cells": total_cells})}
+
+    return _create_range_apply(db_path, role, values, parsed)
+
+
+def _range_confirm_apply(db_path, role, login):
+    pending = _load_range_pending(db_path, login)
+    if not pending:
+        _drop_range_pending(db_path, login)
+        return {"ok": True, "view": _build(db_path, role)}
+
+    values_p = pending.get("values") or {}
+    _drop_range_pending(db_path, login)
+
+    ok, parsed, err = _validate_range_values(
+        values_p, with_shelves=True)
+    if not ok:
+        return _err_view(db_path, role, err)
+
+    return _create_range_apply(db_path, role, values_p, parsed)
+
+
+def _create_range_apply(db_path, role, values, parsed):
+    bid = values.get("block_id")
+    ff = parsed["ff"]
+    ft = parsed["ft"]
+    rf = parsed["rf"]
+    rt = parsed["rt"]
+    sf = parsed["sf"]
+    st = parsed["st"]
+    shelves_count = parsed["shelves_count"]
+    per_shelf = parsed["per_shelf"]
 
     conn = sqlite3.connect(db_path)
     try:
@@ -600,13 +952,9 @@ def _create_range(db_path, role, values):
         cur.execute("SELECT name FROM blocks WHERE id=?", (bid,))
         row = cur.fetchone()
         if not row:
-            return {"ok": True,
-                    "view": _build(
-                        db_path, role,
-                        alert_dialog=_alert_dialog(
-                            tr("common.error", "Ошибка"),
-                            tr("settings.err.block_not_found",
-                               "Блок не найден.")))}
+            return _err_view(db_path, role, tr(
+                "settings.err.block_not_found",
+                "Блок не найден."))
         bname = row[0]
         try:
             bnum = int(_format_block_name(bname))
@@ -619,24 +967,23 @@ def _create_range(db_path, role, values):
         sfx = s.get("suffix_cell", "")
 
         created = skipped = 0
+        since_commit = 0
+
         for f in range(ff, ft + 1):
             bf = f"{bnum}{f}"
             for r in range(rf, rt + 1):
                 for sec in range(sf, st + 1):
                     for i in range(shelves_count):
                         letter = chr(ord('A') + i)
-                        try:
-                            per_shelf = int(
-                                values.get(f"shelf_{i}") or 1)
-                        except (ValueError, TypeError):
-                            per_shelf = 1
-                        for n in range(1, per_shelf + 1):
+                        per = per_shelf[i]
+                        for n in range(1, per + 1):
                             cell = f"{letter}{n}"
                             addr = f"{bf}-{r:02d}-{sec:02d}-{cell}"
                             bc = (f"{pfx}{bf}{r:02d}{sec:02d}"
                                   f"{cell}{sfx}")
-                            cur.execute("SELECT 1 FROM cells "
-                                        "WHERE address=?", (addr,))
+                            cur.execute(
+                                "SELECT 1 FROM cells "
+                                "WHERE address=?", (addr,))
                             if cur.fetchone():
                                 skipped += 1
                                 continue
@@ -649,6 +996,10 @@ def _create_range(db_path, role, values):
                                         'standart')
                             """, (bid, f, r, sec, cell, addr, bc))
                             created += 1
+                            since_commit += 1
+                            if since_commit >= _RANGE_COMMIT_CHUNK:
+                                conn.commit()
+                                since_commit = 0
         conn.commit()
     finally:
         conn.close()
@@ -665,28 +1016,20 @@ def _create_range(db_path, role, values):
 def _delete_range(db_path, role, values):
     bid = values.get("block_id")
     if bid is None:
-        return {"ok": True,
-                "view": _build(
-                    db_path, role,
-                    alert_dialog=_alert_dialog(
-                        tr("common.error", "Ошибка"),
-                        tr("settings.err.no_block",
-                           "Выберите блок.")))}
-    try:
-        ff = int(values.get("floor_from") or 1)
-        ft = int(values.get("floor_to") or 1)
-        rf = int(values.get("row_from") or 1)
-        rt = int(values.get("row_to") or 1)
-        sf = int(values.get("sec_from") or 1)
-        st = int(values.get("sec_to") or 1)
-    except (ValueError, TypeError):
-        return {"ok": True,
-                "view": _build(
-                    db_path, role,
-                    alert_dialog=_alert_dialog(
-                        tr("common.error", "Ошибка"),
-                        tr("settings.err.numeric",
-                           "Проверьте числовые поля.")))}
+        return _err_view(db_path, role, tr(
+            "settings.err.no_block", "Выберите блок."))
+
+    ok, parsed, err = _validate_range_values(
+        values, with_shelves=False)
+    if not ok:
+        return _err_view(db_path, role, err)
+
+    ff = parsed["ff"]
+    ft = parsed["ft"]
+    rf = parsed["rf"]
+    rt = parsed["rt"]
+    sf = parsed["sf"]
+    st = parsed["st"]
 
     conn = sqlite3.connect(db_path)
     try:
@@ -722,13 +1065,10 @@ def _delete_range(db_path, role, values):
 
         if busy:
             preview = "\n".join(busy[:10])
-            return {"ok": True, "view": _build(
-                db_path, role,
-                alert_dialog=_alert_dialog(
-                    tr("common.error", "Ошибка"),
-                    tr("settings.err.cells_busy",
-                       "Есть товары в ячейках:\n{preview}",
-                       preview=preview)))}
+            return _err_view(db_path, role, tr(
+                "settings.err.cells_busy",
+                "Есть товары в ячейках:\n{preview}",
+                preview=preview))
 
         deleted = 0
         for f in range(ff, ft + 1):

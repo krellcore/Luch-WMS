@@ -12,7 +12,7 @@
 текстом, что и title пункта меню. Клиент сам рендерит заголовок
 из config.menu.items[].title. Иначе заголовок дублируется.
 
-Версия приложения в About — APP_VERSION (1.0.1).
+Версия приложения в About — APP_VERSION (1.1.0).
 """
 
 import traceback
@@ -21,7 +21,7 @@ from i18n import tr
 from view_protocol import make_document, ViewNode
 
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 
 _ITEMS = {}          # id -> dict
 _ORDER_COUNTER = [0]

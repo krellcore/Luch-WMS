@@ -1,6 +1,6 @@
 Пошаговая сборка APK
 ========================================
-Версия: 1.0.1
+Версия: 1.1.0
 
 Подготовка
 ----------
@@ -30,6 +30,7 @@
   - app/src/main/AndroidManifest.xml
   - app/src/main/res/values/strings.xml
   - app/src/main/res/values/themes.xml
+  - app/src/main/res/xml/network_security_config.xml
 
 Удали автосозданный MainActivity.kt и создай структуру заново.
 Все файлы плоские (без подпакетов, кроме api и view):
@@ -124,6 +125,14 @@ Debug-сборка Compose в разы медленнее release. На слаб
     На экранах логина (QR сервера / пропуска) — полноэкранный
     CaptureActivity (zxing), портретная ориентация.
 
+- **TLS/HTTPS с pinning.** Если сервер работает по HTTPS, QR
+  содержит fingerprint: `WMS://ip:port#fp=<base64url(sha256)>`.
+  Клиент при первом скане делает TOFU (сверяет сертификат с fp
+  из QR), сохраняет PEM в `SharedPreferences "wms_certs"` и
+  дальше использует только его (pinning через собственный
+  X509TrustManager + CertificatePinner). Несовпадение — диалог
+  «сертификат изменился».
+- **`allowBackup="false"`, `network_security_config.xml`.**
 - Сессии приёмки на ТСД не показываются: сервер фильтрует
   их по device="android". Если плагин зарегистрирует сессию
   с platforms=("android",) — она появится (тоже со встроенным
@@ -152,6 +161,7 @@ Debug-сборка Compose в разы медленнее release. На слаб
 - wms_ui.{version, config} — полный /ui_config.
 - wms_locales.{data, meta} — производные от ui_config.locales.
 - wms_settings.<server_url> — последние /settings.
+- wms_certs.<server_url> — PEM сертификата сервера (pinning).
 - wms.{locale, server, device_type} — локальные настройки.
 
 Проверка актуальности ui_config:
@@ -170,6 +180,12 @@ Debug-сборка Compose в разы медленнее release. На слаб
 - Встроенный сканер (phone) требует разрешения на камеру. При
   отказе в блоке сканера показывается «Нет доступа к камере»
   и кнопка «Разрешить».
+- При HTTPS первый скан QR уязвим к MITM, если атакующий
+  контролирует и экран «Заданий», и сеть одновременно (TOFU).
+  Все последующие сессии защищены pinning'ом.
+- При смене IP сервера или перевыпуске сертификата
+  («Настройки → Безопасность») все клиенты должны заново
+  отсканировать QR с новым fingerprint.
 - На MT-65 Beluga 3 (2018, 2 ГБ RAM) Compose работает на пределе
   своих возможностей даже в release. Если после всех оптимизаций
   UI всё ещё недостаточно плавный — см. рекомендации в

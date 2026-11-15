@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Phase 1+2: cleartext разрешён для обратной совместимости
+        со старыми складами без TLS. Pinning делается через
+        собственный X509TrustManager в Api.kt, а не через
+        <pin-set>, потому что самоподписанный сертификат
+        не имеет CA-цепочки и не находится в системном
+        хранилище.
+        Phase 3 (принудительный HTTPS): cleartextTrafficPermitted
+        ставится в false.
+    -->
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

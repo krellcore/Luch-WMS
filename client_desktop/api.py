@@ -1,7 +1,16 @@
-"""HTTP-клиент для ПК-терминала."""
+"""HTTP/HTTPS-клиент для ПК-терминала."""
 
 import requests
-from config import load_config, save_config
+
+from config import (
+    load_config, save_config,
+    get_tls_cache, set_tls_cache,
+)
+from tls_client import (
+    fingerprint_of_pem, fetch_peer_cert,
+    write_cert_file, split_host_port,
+    cert_file_path,
+)
 
 
 class ApiError(Exception):
@@ -22,7 +31,7 @@ def humanize_error(err_text):
         "getaddrinfo", "name or service not known",
         "network is unreachable", "connection aborted",
         "connection reset", "connection timed out",
-        "max retries exceeded",
+        "max retries exceeded", "certificate",
     )
     if any(m in low for m in network_markers):
         return "__HUMAN_NETWORK_UNAVAILABLE__"
@@ -110,11 +119,120 @@ class Api:
         cfg = load_config()
         self.locale = cfg.get("locale", "ru")
 
+    def has_saved_cert(self, url):
+        cfg = load_config()
+        return get_tls_cache(cfg, url) is not None
+
+    def set_base(self, url, fp=None):
+        """Устанавливает базовый URL.
+
+        Для HTTPS:
+          - если серт уже сохранён и fp в QR не передан
+            или совпадает — используем сохранённый;
+          - если серт сохранён, но fp другой — TOFU
+            (перевыпуск);
+          - если серта нет, но fp передан — TOFU;
+          - если серта нет и fp нет — ошибка.
+
+        Для HTTP — TLS отключается.
+        """
+        url = (url or "").rstrip("/")
+        if url.startswith("https://"):
+            self._apply_https(url, fp)
+        else:
+            self._disable_tls()
+
+        self.base = url
+        self.settings = {}
+
+    def _apply_https(self, url, qr_fp):
+        cfg = load_config()
+        cached = get_tls_cache(cfg, url)
+
+        if cached:
+            pem = cached.get("pem") or ""
+            saved_fp = cached.get("fp") or ""
+            if not pem:
+                raise ApiError(
+                    "TLS: сохранённый сертификат пуст. "
+                    "Удалите config.json и отсканируйте QR заново.")
+            try:
+                actual_fp = fingerprint_of_pem(pem)
+            except Exception as e:
+                raise ApiError(
+                    f"TLS: повреждён сохранённый сертификат: {e}")
+            if actual_fp != saved_fp:
+                raise ApiError(
+                    "TLS: локальный сертификат повреждён "
+                    "(fp не совпадает). Удалите config.json "
+                    "и отсканируйте QR заново.")
+
+            if qr_fp and qr_fp != saved_fp:
+                # Сервер перевыпустил серт — TOFU заново.
+                self._tofu(url, qr_fp, cfg)
+                return
+
+            write_cert_file(url, pem)
+            p = cert_file_path(url)
+            if not p:
+                raise ApiError(
+                    "TLS: не удалось сохранить сертификат "
+                    "(нет доступа к папке .certs).")
+            self.client.verify = p
+            return
+
+        # Сохранённого серта нет.
+        if not qr_fp:
+            raise ApiError(
+                "TLS: сервер использует HTTPS, но в QR нет "
+                "fingerprint. Отсканируйте QR со страницы "
+                "«Задания» в ПК-клиенте управления.")
+        self._tofu(url, qr_fp, cfg)
+
+    def _tofu(self, url, expected_fp, cfg):
+        host, port = split_host_port(url)
+        try:
+            pem = fetch_peer_cert(host, port, timeout=5)
+        except Exception as e:
+            raise ApiError(
+                f"Не удалось получить сертификат сервера: {e}")
+        if not pem:
+            raise ApiError(
+                "Сервер не вернул сертификат (TLS handshake).")
+        try:
+            actual_fp = fingerprint_of_pem(pem)
+        except Exception as e:
+            raise ApiError(f"Некорректный сертификат: {e}")
+        if actual_fp != expected_fp:
+            raise ApiError(
+                "Сертификат сервера не совпадает с QR. "
+                "Возможна MITM-атака. Не подключайтесь. "
+                "Если сервер действительно перевыпустил "
+                "сертификат — отсканируйте новый QR.")
+        set_tls_cache(cfg, url, actual_fp, pem)
+        save_config(cfg)
+        write_cert_file(url, pem)
+        p = cert_file_path(url)
+        if not p:
+            raise ApiError(
+                "TLS: не удалось сохранить сертификат "
+                "(нет доступа к папке .certs).")
+        self.client.verify = p
+
+    def _disable_tls(self):
+        # HTTP — обычная проверка системных CA не мешает.
+        self.client.verify = True
+
     def _post(self, path, payload, timeout=15):
         payload["locale"] = self.locale
         try:
             r = self.client.post(
                 self.base + path, json=payload, timeout=timeout)
+        except requests.exceptions.SSLError as e:
+            raise ApiError(
+                "Сертификат сервера не соответствует "
+                "сохранённому. Если сервер перевыпущен — "
+                "отсканируйте новый QR.", is_network=True)
         except requests.ConnectionError as e:
             raise ApiError(str(e), is_network=True)
         except requests.Timeout as e:
@@ -138,10 +256,6 @@ class Api:
         except ValueError as e:
             raise ApiError(f"invalid JSON: {e}",
                            is_network=False)
-
-    def set_base(self, url):
-        self.base = url.rstrip("/")
-        self.settings = {}
 
     def set_locale(self, locale):
         self.locale = locale
@@ -170,6 +284,16 @@ class Api:
             return True, None
         return False, r.get("error") or "invalid"
 
+    def logout(self):
+        try:
+            if self.token:
+                self._post("/logout", {"token": self.token},
+                           timeout=5)
+        except Exception:
+            pass
+        self.token = None
+        self.login = ""
+
     def me(self):
         r = self._post("/employees/me", self._with_token())
         if r.get("ok") is not True:
@@ -183,12 +307,6 @@ class Api:
         }
 
     def load_settings(self):
-        """POST /settings. Возвращает True при успехе, иначе False.
-
-        При успехе заполняет self.settings. При ошибке оставляет
-        self.settings как было (— позволяет вызывающему коду
-        подставить кэш).
-        """
         try:
             r = self._post("/settings", self._with_token(),
                            timeout=8)
@@ -211,16 +329,7 @@ class Api:
         })
         return r.get("ok") is True
 
-    # --------------------------------------------------------------
-    # Кэш /ui_config
-    # --------------------------------------------------------------
-
     def ui_config_version(self, local_version="", timeout=3):
-        """POST /ui_config/version → (server_version, changed).
-
-        Возвращает (None, False), если сервер недоступен или
-        ответил ошибкой.
-        """
         try:
             r = self._post(
                 "/ui_config/version",
@@ -233,10 +342,6 @@ class Api:
         return r.get("version") or "", bool(r.get("changed"))
 
     def ui_config(self, timeout=5):
-        """POST /ui_config → (version, config|None).
-
-        (None, None) при ошибке/недоступности.
-        """
         try:
             r = self._post("/ui_config", {}, timeout=timeout)
         except ApiError:
@@ -244,21 +349,6 @@ class Api:
         if r.get("ok") is not True:
             return None, None
         return r.get("version") or "", r.get("config") or {}
-
-    def load_locales(self):
-        """Совместимость: возвращает {code: ServerLocale-like}.
-
-        Берёт из полного /ui_config. Не использовать в новом коде —
-        применяйте ui_config_version() + ui_config().
-        """
-        _ver, cfg = self.ui_config(timeout=5)
-        if not cfg:
-            return None
-        return _parse_locales(cfg)
-
-    # --------------------------------------------------------------
-    # Сессии / задачи / уведомления (без изменений)
-    # --------------------------------------------------------------
 
     def sessions_list(self):
         r = self._post("/sessions/list",
@@ -363,10 +453,6 @@ class Api:
                        self._with_token(ids=list(ids)))
         return r.get("ok") is True
 
-    # --------------------------------------------------------------
-    # Envelopes
-    # --------------------------------------------------------------
-
     def _parse_common(self, r):
         view = r.get("view") or {}
         children = view.get("children") or []
@@ -435,7 +521,6 @@ class Api:
 
 
 def _parse_locales(cfg):
-    """config из /ui_config → {code: {name, rtl, fallback, data}}."""
     loc = (cfg or {}).get("locales") or {}
     available = loc.get("available") or []
     data = loc.get("data") or {}

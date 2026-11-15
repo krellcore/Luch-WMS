@@ -1,7 +1,6 @@
 """«Руководители» — серверная сборка view и действия."""
 
 import sqlite3
-import hashlib
 import secrets
 
 from mgmt_protocol import (
@@ -11,6 +10,7 @@ from mgmt_protocol import (
 )
 from mgmt_view_builder import build_sidebar
 from i18n import tr
+from db import hash_password, invalidate_sessions
 
 
 MANAGEABLE_ROLES = ("admin", "operator")
@@ -24,10 +24,6 @@ def _role_label(role):
         "operator": "Оператор",
     }.get(role or "operator", role or "")
     return tr(key, default)
-
-
-def _hash(pwd):
-    return hashlib.sha256(pwd.encode("utf-8")).hexdigest()
 
 
 def _doc(page, role):
@@ -300,10 +296,12 @@ def handle_action(action, action_id, value, login, role,
                             "managers.err.role_invalid",
                             "недопустимая роль")}
             conn = sqlite3.connect(db_path)
+            changed_login = None
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT role FROM managers WHERE id=?", (mid,))
+                    "SELECT role, login FROM managers WHERE id=?",
+                    (mid,))
                 r = cur.fetchone()
                 if not r:
                     return {"ok": True, "view": _doc(
@@ -318,12 +316,19 @@ def handle_action(action, action_id, value, login, role,
                             error=tr(
                                 "managers.err.owner_protected",
                                 "владельца менять нельзя")), role)}
+                changed_login = r[1]
                 cur.execute(
                     "UPDATE managers SET role=? WHERE id=?",
                     (new_role, mid))
                 conn.commit()
             finally:
                 conn.close()
+            if changed_login:
+                try:
+                    invalidate_sessions(
+                        db_path, changed_login, "manager")
+                except Exception:
+                    pass
             return {"ok": True,
                     "message": tr("managers.msg.role_saved",
                                   "Роль сохранена"),
@@ -335,24 +340,33 @@ def handle_action(action, action_id, value, login, role,
                 return {"ok": False,
                         "error": tr("managers.err.bad_id",
                                     "bad id")}
-            new_password = secrets.token_urlsafe(8)
+            new_password = secrets.token_urlsafe(12)
             conn = sqlite3.connect(db_path)
+            changed_login = None
             try:
                 cur = conn.cursor()
                 cur.execute(
-                    "SELECT 1 FROM managers WHERE id=?", (mid,))
-                if not cur.fetchone():
+                    "SELECT login FROM managers WHERE id=?", (mid,))
+                r = cur.fetchone()
+                if not r:
                     return {"ok": True, "view": _doc(
                         _build_list(
                             db_path, role,
                             error=tr("managers.err.not_found",
                                      "не найден")), role)}
+                changed_login = r[0]
                 cur.execute(
                     "UPDATE managers SET pass_hash=? WHERE id=?",
-                    (_hash(new_password), mid))
+                    (hash_password(new_password), mid))
                 conn.commit()
             finally:
                 conn.close()
+            if changed_login:
+                try:
+                    invalidate_sessions(
+                        db_path, changed_login, "manager")
+                except Exception:
+                    pass
             return {"ok": True,
                     "message": tr("managers.msg.new_password",
                                   "Новый пароль: {password}",
@@ -394,9 +408,9 @@ def _add_commit(db_path, role, values):
         if not ((ch.isascii() and ch.isalnum()) or ch in "_."):
             return _err(tr("managers.err.login_format",
                            "логин: только a-z, 0-9, _ и ."))
-    if len(pwd) < 4:
+    if len(pwd) < 8:
         return _err(tr("managers.err.password_short",
-                       "пароль — минимум 4 символа"))
+                       "пароль — минимум 8 символов"))
     if pwd != pwd2:
         return _err(tr("managers.err.password_mismatch",
                        "пароли не совпадают"))
@@ -415,7 +429,7 @@ def _add_commit(db_path, role, values):
         cur.execute("""
             INSERT INTO managers (login, pass_hash, role, created_at)
             VALUES (?, ?, ?, datetime('now'))
-        """, (login_v, _hash(pwd), new_role))
+        """, (login_v, hash_password(pwd), new_role))
         conn.commit()
     finally:
         conn.close()

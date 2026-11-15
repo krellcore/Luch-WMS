@@ -1,5 +1,6 @@
 package com.wms.client.api
 
+import android.util.Base64
 import com.google.gson.Gson
 import com.google.gson.JsonObject
 import com.google.gson.reflect.TypeToken
@@ -15,13 +16,27 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.net.InetSocketAddress
+import java.security.KeyStore
+import java.security.MessageDigest
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLException
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.TrustManager
+import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
 
 
 class ApiException(
     message: String,
-    val isNetwork: Boolean = false
+    val isNetwork: Boolean = false,
+    val isTls: Boolean = false,
+    val tlsFp: String = ""
 ) : Exception(message)
 
 
@@ -75,18 +90,103 @@ data class SessionInfo(
 
 
 class Api {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .build()
-
-    private val gson = Gson()
-    private val jsonType = "application/json; charset=utf-8".toMediaType()
-
     var base: String = ""
     var token: String? = null
     var locale: String = "ru"
     val settings = mutableMapOf<String, String>()
+
+    var serverPem: String = ""
+        private set
+
+    private val gson = Gson()
+    private val jsonType = "application/json; charset=utf-8".toMediaType()
+
+    private var client: OkHttpClient = defaultClient()
+
+    private fun defaultClient(): OkHttpClient =
+        OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .build()
+
+    private fun pinnedClient(pem: String): OkHttpClient {
+        val trust = makeTrustManager(pem)
+        val ctx = SSLContext.getInstance("TLS")
+        ctx.init(null, arrayOf<TrustManager>(trust), null)
+        return OkHttpClient.Builder()
+            .connectTimeout(5, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .sslSocketFactory(ctx.socketFactory, trust)
+            .build()
+    }
+
+    /**
+     * Устанавливает базовый URL.
+     *
+     * Для HTTPS обязателен [pem] — сертификат сервера,
+     * сохранённый ранее или полученный через [doTofu].
+     * Клиент будет доверять ТОЛЬКО этому сертификату
+     * (системные CA игнорируются — это pinning).
+     */
+    fun setBase(url: String, pem: String?) {
+        base = url.trimEnd('/')
+        token = null
+        settings.clear()
+        if (base.startsWith("https://")) {
+            if (pem.isNullOrBlank()) {
+                throw ApiException(
+                    "TLS: сертификат сервера не передан",
+                    isNetwork = false, isTls = true)
+            }
+            serverPem = pem
+            client = pinnedClient(pem)
+        } else {
+            serverPem = ""
+            client = defaultClient()
+        }
+    }
+
+    /**
+     * Нужен ли TOFU для данного URL?
+     *
+     * - http → false (TLS нет).
+     * - https + сохранённого PEM нет → true.
+     * - https + сохранённый PEM есть + fp в QR отсутствует
+     *   → false (используем сохранённый).
+     * - https + сохранённый PEM есть + fp в QR есть
+     *   и совпадает → false.
+     * - https + сохранённый PEM есть + fp в QR есть
+     *   и НЕ совпадает → true (сервер перевыпустил серт).
+     */
+    fun needsTofu(url: String, fpInQr: String?, savedPem: String?): Boolean {
+        if (!url.startsWith("https://")) return false
+        if (savedPem.isNullOrBlank()) return true
+        if (fpInQr.isNullOrBlank()) return false
+        return fingerprintOfPem(savedPem) != fpInQr
+    }
+
+    /**
+     * Выполняет TOFU: забирает сертификат с сервера
+     * без валидации, сверяет fingerprint с [fpInQr].
+     * Возвращает PEM для сохранения.
+     * Блокирующий — вызывать из Dispatchers.IO.
+     */
+    fun doTofu(url: String, fpInQr: String): String {
+        val (host, port) = splitHostPort(url)
+        val pem = fetchPeerPem(host, port)
+            ?: throw ApiException(
+                "Сервер не вернул сертификат",
+                isNetwork = true, isTls = true)
+        val actual = fingerprintOfPem(pem)
+        if (actual != fpInQr) {
+            throw ApiException(
+                "Сертификат сервера не совпадает с QR. " +
+                "Возможна MITM-атака.",
+                isNetwork = false, isTls = true,
+                tlsFp = actual)
+        }
+        return pem
+    }
 
     private fun post(path: String, body: Map<String, Any?>): JsonObject {
         val mutableBody = body.toMutableMap()
@@ -101,6 +201,10 @@ class Api {
                 val text = resp.body?.string().orEmpty()
                 return gson.fromJson(text, JsonObject::class.java)
             }
+        } catch (e: SSLException) {
+            throw ApiException(
+                e.message ?: "TLS handshake failed",
+                isNetwork = true, isTls = true)
         } catch (e: java.net.ConnectException) {
             throw ApiException(e.message ?: "connection refused",
                 isNetwork = true)
@@ -142,6 +246,19 @@ class Api {
         }
     }
 
+    fun logout(): Boolean {
+        return try {
+            val old = token
+            token = old
+            val r = post("/logout", withToken())
+            token = null
+            r.get("ok")?.asBoolean == true
+        } catch (_: Exception) {
+            token = null
+            false
+        }
+    }
+
     fun me(): MeInfo {
         val r = post("/employees/me", withToken())
         if (r.get("ok")?.asBoolean != true) return MeInfo()
@@ -153,7 +270,6 @@ class Api {
         return MeInfo(fio, roles)
     }
 
-    /** POST /settings. Возвращает true при успехе. */
     fun loadSettings(): Boolean {
         val r = post("/settings", withToken())
         if (r.get("ok")?.asBoolean == true) {
@@ -187,7 +303,6 @@ class Api {
         return r.get("ok")?.asBoolean == true
     }
 
-    /** GET-подобный: читает список языков из /ui_config. */
     fun loadLocales(): Map<String, ServerLocale>? {
         val r = post("/ui_config", emptyMap())
         if (r.get("ok")?.asBoolean != true) return null
@@ -427,5 +542,93 @@ class Api {
         }
 
         return ViewEnvelope(nodes, meta, msg, nf)
+    }
+}
+
+
+// ================================================================
+// TLS: pinning через собственный TrustManager.
+// ================================================================
+
+private fun makeTrustManager(pem: String): X509TrustManager {
+    val cf = CertificateFactory.getInstance("X.509")
+    val cert = cf.generateCertificate(
+        ByteArrayInputStream(pem.toByteArray(Charsets.US_ASCII))
+    ) as X509Certificate
+    val ks = KeyStore.getInstance(KeyStore.getDefaultType())
+    ks.load(null, null)
+    ks.setCertificateEntry("server", cert)
+    val tmf = TrustManagerFactory.getInstance(
+        TrustManagerFactory.getDefaultAlgorithm())
+    tmf.init(ks)
+    for (tm in tmf.trustManagers) {
+        if (tm is X509TrustManager) return tm
+    }
+    throw IllegalStateException("no X509TrustManager")
+}
+
+
+fun fingerprintOfDer(der: ByteArray): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(der)
+    return Base64.encodeToString(
+        digest,
+        Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+}
+
+
+fun fingerprintOfPem(pem: String): String {
+    val cf = CertificateFactory.getInstance("X.509")
+    val cert = cf.generateCertificate(
+        ByteArrayInputStream(pem.toByteArray(Charsets.US_ASCII))
+    ) as X509Certificate
+    return fingerprintOfDer(cert.encoded)
+}
+
+
+private fun fetchPeerPem(host: String, port: Int,
+                         timeoutMs: Int = 5000): String? {
+    val trustAll = arrayOf<TrustManager>(object : X509TrustManager {
+        override fun checkClientTrusted(
+            chain: Array<X509Certificate>, authType: String) {}
+        override fun checkServerTrusted(
+            chain: Array<X509Certificate>, authType: String) {}
+        override fun getAcceptedIssuers(): Array<X509Certificate> =
+            emptyArray()
+    })
+    val ctx = SSLContext.getInstance("TLS")
+    ctx.init(null, trustAll, null)
+    val socket = ctx.socketFactory.createSocket() as SSLSocket
+    try {
+        socket.soTimeout = timeoutMs
+        socket.connect(InetSocketAddress(host, port), timeoutMs)
+        socket.startHandshake()
+        val cert = socket.session.peerCertificates
+            .firstOrNull() as? X509Certificate ?: return null
+        val b64 = Base64.encodeToString(cert.encoded, Base64.NO_WRAP)
+        val sb = StringBuilder()
+        sb.append("-----BEGIN CERTIFICATE-----\n")
+        for (chunk in b64.chunked(64)) {
+            sb.append(chunk).append("\n")
+        }
+        sb.append("-----END CERTIFICATE-----\n")
+        return sb.toString()
+    } finally {
+        try { socket.close() } catch (_: Exception) {}
+    }
+}
+
+
+fun splitHostPort(url: String): Pair<String, Int> {
+    var s = url.trim()
+    if (s.startsWith("https://")) s = s.removePrefix("https://")
+    else if (s.startsWith("http://")) s = s.removePrefix("http://")
+    s = s.substringBefore("/")
+    return if (":" in s) {
+        val idx = s.lastIndexOf(':')
+        val h = s.substring(0, idx)
+        val port = s.substring(idx + 1).toIntOrNull() ?: 8765
+        h to port
+    } else {
+        s to 8765
     }
 }

@@ -122,7 +122,7 @@ class MgmtRenderer(QWidget):
                     values[fid] = w.text()
             except Exception:
                 pass
-                
+
         for fid, (table, n) in self._tables.items():
             cols = n.get("columns") or []
             rows = []
@@ -134,7 +134,7 @@ class MgmtRenderer(QWidget):
                     row[key] = item.text() if item else ""
                 rows.append(row)
             values[fid] = rows
-            
+
             selected = []
             sel_model = table.selectionModel()
             if sel_model:
@@ -146,7 +146,7 @@ class MgmtRenderer(QWidget):
                         row_dict[key] = item.text() if item else ""
                     selected.append(row_dict)
             values[fid + "_selected"] = selected
-            
+
         return values
 
     def _render(self, node):
@@ -212,17 +212,17 @@ class MgmtRenderer(QWidget):
         lbl.setFont(f)
         if style.get("color"):
             lbl.setStyleSheet(f"color:{style['color']};")
-            
+
         align = style.get("align")
         if align == "center":
             lbl.setAlignment(Qt.AlignCenter)
         elif align == "right":
             lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            
+
         w = int(n.get("width") or 0)
         if w > 0:
             lbl.setFixedWidth(w)
-            
+
         return lbl
 
     def _node_heading(self, n):
@@ -256,7 +256,7 @@ class MgmtRenderer(QWidget):
                 continue
             stretch = 1 if _has_stretch(c) else 0
             layout.addWidget(w, stretch)
-        
+
         if _has_stretch(n) and not any_stretch:
             layout.addStretch()
         return frame
@@ -276,10 +276,10 @@ class MgmtRenderer(QWidget):
                 continue
             stretch = 1 if _has_stretch(c) else 0
             layout.addWidget(cw, stretch)
-        
+
         if is_horiz and not any_stretch:
             layout.addStretch()
-            
+
         return w
 
     def _node_divider(self):
@@ -334,10 +334,15 @@ class MgmtRenderer(QWidget):
         browser = QTextBrowser()
         browser.document().setDocumentMargin(0)
         browser.setHtml(n.get("html") or "")
-        browser.setOpenExternalLinks(True)
+        # Безопасность: внешние ссылки не открываются автоматически
+        # (фишинг/утечка Referer). Ссылки внутри документа не
+        # навигируют.
+        browser.setOpenExternalLinks(False)
+        browser.setOpenLinks(False)
         browser.setStyleSheet(
-            "QTextBrowser { background-color: transparent; border: none; padding: 0; }")
-        
+            "QTextBrowser { background-color: transparent; "
+            "border: none; padding: 0; }")
+
         w = int(n.get("width") or 0)
         h = int(n.get("height") or 0)
         if w > 0 and h > 0:
@@ -346,7 +351,7 @@ class MgmtRenderer(QWidget):
             browser.setFixedWidth(w)
         elif h > 0:
             browser.setFixedHeight(h)
-            
+
         browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         return browser
@@ -597,7 +602,7 @@ class MgmtRenderer(QWidget):
                 QAbstractItemView.AnyKeyPressed)
         else:
             table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-            
+
         fid = n.get("field_id") or f"table_{len(self._tables)}"
         self._tables[fid] = (table, n)
 
@@ -626,7 +631,7 @@ class MgmtRenderer(QWidget):
                     if ctype == "number":
                         it.setTextAlignment(
                             Qt.AlignRight | Qt.AlignVCenter)
-                        
+
                     if n.get("editable") and c.get("key") == "qty":
                         it.setFlags(Qt.ItemIsEnabled |
                                     Qt.ItemIsSelectable |
@@ -634,7 +639,7 @@ class MgmtRenderer(QWidget):
                     else:
                         it.setFlags(Qt.ItemIsEnabled |
                                     Qt.ItemIsSelectable)
-                        
+
                 table.setItem(r_idx, c_idx, it)
 
         v.addWidget(table, 1)
@@ -700,12 +705,12 @@ class MgmtRenderer(QWidget):
     def _node_file_trigger(self, n):
         btn = QPushButton(n.get("label") or "Файл")
         btn.setCursor(Qt.PointingHandCursor)
-        
+
         if n.get("style") == "primary":
             btn.setObjectName("primary_btn")
         elif n.get("style") == "danger":
             btn.setObjectName("danger_btn")
-            
+
         kind = n.get("action") or "download"
 
         if kind == "download":
@@ -771,7 +776,7 @@ class MgmtRenderer(QWidget):
             row = QHBoxLayout()
             left_row = QHBoxLayout()
             right_row = QHBoxLayout()
-            
+
             right_row.addStretch()
             for b in btns:
                 bw = self._render(b)
@@ -780,7 +785,7 @@ class MgmtRenderer(QWidget):
                         left_row.addWidget(bw)
                     else:
                         right_row.addWidget(bw)
-                        
+
             row.addLayout(left_row)
             row.addStretch()
             row.addLayout(right_row)
@@ -819,6 +824,12 @@ def _wire_debounce(line_edit, on_flush, interval=400):
 
 
 def _load_pixmap(src):
+    """Загружает QPixmap.
+
+    Безопасность (SSRF): разрешены только `data:` и локальные
+    файлы. `http(s)://` отключено — плагин или MITM не должны
+    заставлять клиент ходить по произвольным URL.
+    """
     if not src:
         return None
     pm = QPixmap()
@@ -832,14 +843,6 @@ def _load_pixmap(src):
             return None
         return None
     if src.startswith("http://") or src.startswith("https://"):
-        try:
-            import urllib.request
-            with urllib.request.urlopen(src, timeout=4) as resp:
-                raw = resp.read()
-            if pm.loadFromData(raw):
-                return pm
-        except Exception:
-            return None
         return None
     if os.path.exists(src):
         try:

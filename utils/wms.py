@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import sqlite3
+import ssl
 import urllib.request
 import urllib.error
 
@@ -30,7 +31,7 @@ except Exception:
     def server_set_host(host):
         pass
 
-    def start_server(db_path, host="0.0.0.0", port=8765):
+    def start_server(db_path, host="0.0.0.0", port=8765, tls=False):
         raise RuntimeError("server module unavailable")
 
     def stop_server():
@@ -104,7 +105,27 @@ def _save_last_server(url):
         print("save last_server:", e)
 
 
-def _mgmt_post(server_url, path, payload, locale="ru", timeout=10):
+def _client_ssl_ctx(cert_path):
+    """SSLContext для HTTPS-клиента (только указанный серт).
+
+    Возвращает None, если cert_path не задан — тогда
+    используется HTTP.
+    """
+    if not cert_path or not os.path.isfile(cert_path):
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        ctx.load_verify_locations(cafile=cert_path)
+        return ctx
+    except Exception as e:
+        print(f"[wms] ssl ctx: {e}")
+        return None
+
+
+def _mgmt_post(server_url, path, payload, locale="ru",
+               timeout=10, cert_path=None):
     payload = dict(payload or {})
     payload["locale"] = locale
     data = json.dumps(payload).encode("utf-8")
@@ -116,14 +137,22 @@ def _mgmt_post(server_url, path, payload, locale="ru", timeout=10):
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8")
+    ctx = _client_ssl_ctx(cert_path)
+    if ctx is not None:
+        with urllib.request.urlopen(
+                req, timeout=timeout, context=ctx) as resp:
+            raw = resp.read().decode("utf-8")
+    else:
+        with urllib.request.urlopen(
+                req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
     return json.loads(raw)
 
 
 class ManagerLoginDialog(QDialog):
     def __init__(self, default_server="http://127.0.0.1:8765",
-                 default_locale="ru", parent=None):
+                 default_locale="ru", parent=None,
+                 cert_path=None):
         super().__init__(parent)
         self.setWindowTitle(tr("login.dialog.title",
                                "Луч — Вход в управление складом"))
@@ -136,6 +165,7 @@ class ManagerLoginDialog(QDialog):
         self.warehouse_name = ""
         self.server_url = default_server
         self.locale = default_locale or "ru"
+        self.cert_path = cert_path
 
         base_dir = os.path.dirname(os.path.dirname(
             os.path.abspath(__file__)))
@@ -235,7 +265,8 @@ class ManagerLoginDialog(QDialog):
         try:
             r = _mgmt_post(server, "/mgmt/login",
                            {"login": login, "secret": pwd},
-                           locale=self.locale)
+                           locale=self.locale,
+                           cert_path=self.cert_path)
         except urllib.error.URLError as e:
             self.error_label.setText(tr(
                 "login.dialog.server_unavailable",
@@ -268,7 +299,8 @@ class ManagerLoginDialog(QDialog):
         try:
             me = _mgmt_post(server, "/mgmt/me",
                             {"token": token},
-                            locale=self.locale)
+                            locale=self.locale,
+                            cert_path=self.cert_path)
         except Exception as e:
             self.error_label.setText(tr(
                 "login.dialog.profile_error",
@@ -298,7 +330,9 @@ class WarehouseApp(QMainWindow):
                  manager_token=None, manager_server_url=None,
                  warehouse_name=None,
                  remote_mode=False,
-                 locale="ru"):
+                 locale="ru",
+                 tls_enabled=False,
+                 cert_path=None):
         super().__init__()
         self.db_path = db_path
         self.safe_mode = safe_mode
@@ -310,13 +344,15 @@ class WarehouseApp(QMainWindow):
         self.remote_mode = remote_mode
         self.locale = locale or "ru"
         self._warehouse_name = warehouse_name
+        self._tls_enabled = bool(tls_enabled)
+        self._cert_path = cert_path
 
         if not remote_mode and db_path:
             run_all_migrations(db_path)
 
         if not remote_mode and db_path:
             try:
-                start_server(db_path)
+                start_server(db_path, tls=self._tls_enabled)
             except Exception as e:
                 print(f"[wms] сервер не запущен: {e}")
 
@@ -405,9 +441,6 @@ class WarehouseApp(QMainWindow):
                 except Exception as e:
                     print(f"[wms] плагины: {e}")
 
-        # Синхронизировать сайдбар с сервером (нужно для удалённого
-        # режима и для случаев, когда плагин зарегистрировал новые
-        # страницы уже после старта).
         QTimer.singleShot(0, self._refresh_pages_from_server)
 
         self._badge_timer = QTimer(self)
@@ -434,6 +467,8 @@ class WarehouseApp(QMainWindow):
             title += f"  [{self.manager_login} / {self.manager_role}]"
         if self.safe_mode:
             title += "  [SAFE MODE]"
+        if self._tls_enabled and not self.remote_mode:
+            title += "  [TLS]"
         self.setWindowTitle(title)
 
     def _retranslate_sidebar(self):
@@ -544,7 +579,9 @@ class WarehouseApp(QMainWindow):
                 return
 
         try:
-            page = MgmtPageBase(self.db_path, self, page_key=key)
+            page = MgmtPageBase(self.db_path, self,
+                                page_key=key,
+                                cert_path=self._cert_path)
         except Exception as e:
             import traceback
             print(f"[wms] не удалось создать страницу {key}: {e}")
@@ -586,19 +623,13 @@ class WarehouseApp(QMainWindow):
                 pass
 
     def _refresh_pages_from_server(self):
-        """Синхронизирует сайдбар со списком страниц на сервере.
-
-        Нужно, когда плагин регистрирует mgmt-страницу, а клиент
-        об этом не знает: например, в удалённом режиме (плагин
-        живёт на сервере) или когда плагин активирован после
-        старта клиента.
-        """
         if not self.manager_server_url or not self.manager_token:
             return
         try:
             r = _mgmt_post(
                 self.manager_server_url, "/mgmt/pages",
-                {"token": self.manager_token}, locale=self.locale)
+                {"token": self.manager_token}, locale=self.locale,
+                cert_path=self._cert_path)
         except Exception as e:
             print(f"[wms] refresh pages: {e}")
             return
@@ -612,7 +643,6 @@ class WarehouseApp(QMainWindow):
             title = p.get("title") or key
             if key in self.pages:
                 continue
-            # Встроенные уже зарегистрированы через PAGES.
             if key in known_keys:
                 continue
             self._try_register(key, title)
@@ -745,7 +775,6 @@ class WarehouseApp(QMainWindow):
             "handler": handler,
             "plugin": plugin_name,
         }
-        # Добавить страницу в сайдбар клиента, если роль подходит.
         if self.manager_role is None:
             return
         if roles:
@@ -873,6 +902,7 @@ def main():
     server_url = None
     wh_path = None
     safe_mode = "--safe" in args
+    force_tls = "--tls" in args
     cli_locale = None
     i = 0
     while i < len(args):
@@ -894,6 +924,39 @@ def main():
             return cli_locale
         return _load_locale_for(db_path)
 
+    def _resolve_tls(wh_path_, force):
+        if not wh_path_:
+            return False
+        db_path_ = os.path.join(wh_path_, "warehouse.db")
+        if not os.path.isfile(db_path_):
+            return False
+        if force:
+            enabled = True
+        else:
+            try:
+                conn = sqlite3.connect(db_path_)
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT value FROM settings "
+                    "WHERE key='tls_enabled'")
+                r = cur.fetchone()
+                conn.close()
+                enabled = bool(r) and str(r[0]) == "1"
+            except Exception:
+                enabled = False
+        if not enabled:
+            return False
+        cert = os.path.join(wh_path_, "tls", "cert.pem")
+        if not os.path.isfile(cert):
+            try:
+                from tls import generate_cert
+                print("[wms] TLS: сертификат не найден — генерирую")
+                generate_cert(wh_path_)
+            except Exception as e:
+                print(f"[wms] TLS: {e}. Стартуем без TLS")
+                return False
+        return True
+
     if server_url:
         db_path = None
         if wh_path:
@@ -904,8 +967,19 @@ def main():
         loc = _pick_locale(db_path)
         set_locale(loc)
 
+        tls_enabled = _resolve_tls(wh_path, force_tls) \
+            if wh_path else server_url.startswith("https://")
+        cert_path = None
+        if tls_enabled and wh_path:
+            cert_path = os.path.join(wh_path, "tls", "cert.pem")
+
+        if tls_enabled and not server_url.startswith("https://"):
+            # URL пришёл http://, но --tls — принудительно https.
+            server_url = server_url.replace("http://", "https://", 1)
+
         dlg = ManagerLoginDialog(default_server=server_url,
-                                 default_locale=loc)
+                                 default_locale=loc,
+                                 cert_path=cert_path)
         if dlg.exec() != QDialog.Accepted:
             sys.exit(0)
 
@@ -921,15 +995,17 @@ def main():
             warehouse_name=dlg.warehouse_name,
             remote_mode=True,
             locale=dlg.locale,
+            tls_enabled=tls_enabled,
+            cert_path=cert_path,
         )
         window.show()
         sys.exit(app.exec())
 
     if not wh_path:
         print("Использование: wms.py <папка_склада> [--safe] "
-              "[--locale <code>]")
+              "[--tls] [--locale <code>]")
         print("              wms.py --server URL [<папка_склада>] "
-              "[--locale <code>]")
+              "[--locale <code>] [--tls]")
         sys.exit(1)
     if not os.path.isdir(wh_path):
         print(f"Папка склада не найдена: {wh_path}")
@@ -943,13 +1019,21 @@ def main():
     set_locale(loc)
     run_all_migrations(db_path)
 
+    tls_enabled = _resolve_tls(wh_path, force_tls)
+    cert_path = None
+    if tls_enabled:
+        cert_path = os.path.join(wh_path, "tls", "cert.pem")
+
     manager_login = None
     manager_role = None
     manager_token = None
-    manager_server_url = "http://127.0.0.1:8765"
+    if tls_enabled:
+        manager_server_url = "https://127.0.0.1:8765"
+    else:
+        manager_server_url = "http://127.0.0.1:8765"
 
     try:
-        start_server(db_path)
+        start_server(db_path, tls=tls_enabled)
     except Exception as e:
         QMessageBox.critical(
             None, tr("launcher.error", "Ошибка"),
@@ -959,7 +1043,8 @@ def main():
         sys.exit(1)
 
     dlg = ManagerLoginDialog(default_server=manager_server_url,
-                             default_locale=loc)
+                             default_locale=loc,
+                             cert_path=cert_path)
     if dlg.exec() != QDialog.Accepted:
         try:
             stop_server()
@@ -983,6 +1068,8 @@ def main():
         warehouse_name=wh_name,
         remote_mode=False,
         locale=dlg.locale,
+        tls_enabled=tls_enabled,
+        cert_path=cert_path,
     )
     window.show()
     sys.exit(app.exec())

@@ -27,6 +27,44 @@ def _doc(page, role):
         extra={"role": role})
 
 
+def _num_to_float(s):
+    """Строка → float. Принимает запятую как разделитель.
+    Пустое/нечисловое → 0.0."""
+    if s is None:
+        return 0.0
+    s = str(s).strip().replace(",", ".")
+    if not s:
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _is_number_or_empty(s):
+    """True, если строка — число (в т.ч. с запятой) или пустая."""
+    if s is None:
+        return True
+    s = str(s).strip().replace(",", ".")
+    if not s:
+        return True
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _fmt_dim(v):
+    """Форматирует размер: '100' для целых, '100.5' для дробных."""
+    try:
+        if v == int(v):
+            return str(int(v))
+    except (ValueError, OverflowError):
+        pass
+    return f"{v:g}"
+
+
 def _list_rows(db_path):
     conn = sqlite3.connect(db_path)
     try:
@@ -362,6 +400,25 @@ def _build_card(db_path, role, code, login, message=None, error=None,
                 280, 80, "—", "white", "#95a5a6", "#ddd")
             bc_widget = mgmt_image(ph_b64, width=280, height=80)
 
+        # FIX: объём считается в реальном времени.
+        # Если пользователь редактирует хотя бы одно из полей
+        # (length/width/height), используем ТОЛЬКО values — иначе
+        # при очистке поля показывалось бы старое значение из БД.
+        # Если values пусто — берём из БД (view/edit initial).
+        _editing_dims = any(
+            k in values for k in ("length", "width", "height")
+        )
+        if _editing_dims:
+            current_vol = None
+        else:
+            current_vol = vol
+
+        Lf = _num_to_float(get_val("length", L))
+        Wf = _num_to_float(get_val("width", W))
+        Hf = _num_to_float(get_val("height", H))
+        if Lf and Wf and Hf:
+            current_vol = Lf * Wf * Hf / 1_000_000.0
+
         fields = [
             mgmt_form_field(
                 "name", kind="text",
@@ -394,19 +451,22 @@ def _build_card(db_path, role, code, login, message=None, error=None,
                 label=tr("items.card.length", "Длина (мм):"),
                 label_position="left", label_width=150,
                 stretch=True,
-                value=get_val("length", L)),
+                value=get_val("length", L),
+                on_change="instant"),
             mgmt_form_field(
                 "width", kind="text",
                 label=tr("items.card.width", "Ширина (мм):"),
                 label_position="left", label_width=150,
                 stretch=True,
-                value=get_val("width", W)),
+                value=get_val("width", W),
+                on_change="instant"),
             mgmt_form_field(
                 "height", kind="text",
                 label=tr("items.card.height", "Высота (мм):"),
                 label_position="left", label_width=150,
                 stretch=True,
-                value=get_val("height", H)),
+                value=get_val("height", H),
+                on_change="instant"),
             mgmt_form_field(
                 "weight", kind="text",
                 label=tr("items.card.weight", "Вес (г):"),
@@ -415,16 +475,6 @@ def _build_card(db_path, role, code, login, message=None, error=None,
                 value=get_val("weight",
                               str(w) if w is not None else "")),
         ]
-
-        current_vol = vol
-        try:
-            Lf = float(get_val("length", L) or 0)
-            Wf = float(get_val("width", W) or 0)
-            Hf = float(get_val("height", H) or 0)
-            if Lf and Wf and Hf:
-                current_vol = Lf * Wf * Hf / 1_000_000.0
-        except ValueError:
-            pass
 
         fields.append(group([
             text(tr("items.card.volume", "<b>Объём (л):</b>"),
@@ -549,7 +599,10 @@ def handle_action(action, action_id, value, login, role,
         return {"ok": True, "view": _doc(
             _build_list(db_path, role), role)}
 
-    if action == "input_submit" and action_id == "barcode":
+    # FIX: пересчитываем объём при вводе в любое из размерных полей
+    # (и при вводе ШК — чтобы превью ШК обновлялось).
+    if action == "input_submit" and action_id in (
+            "barcode", "length", "width", "height"):
         state = _get_state(db_path, login)
         mode = state.get("mode", "create")
         code = state.get("code", "")
@@ -652,7 +705,7 @@ def _save(db_path, role, values, mode, original_code, login):
     weight = None
     if weight_raw:
         try:
-            weight = float(weight_raw)
+            weight = float(weight_raw.replace(",", "."))
         except ValueError:
             return {"ok": True, "view": _doc(_build_card(
                 db_path, role, original_code, login,
@@ -660,16 +713,28 @@ def _save(db_path, role, values, mode, original_code, login):
                 error=tr("items.err.weight_number",
                          "Вес должен быть числом.")), role)}
 
-    dims = ""
-    if L or W or H:
+    # FIX: проверяем, что размеры — числа (раньше молча писался
+    # volume=NULL, пользователь не понимал, почему объёма нет).
+    if not all(_is_number_or_empty(x) for x in (L, W, H)):
+        return {"ok": True, "view": _doc(_build_card(
+            db_path, role, original_code, login,
+            mode=mode, values=values,
+            error=tr("items.err.dim_number",
+                     "Длина, ширина и высота должны быть "
+                     "числами.")), role)}
+
+    Lf = _num_to_float(L)
+    Wf = _num_to_float(W)
+    Hf = _num_to_float(H)
+
+    if Lf and Wf and Hf:
+        dims = f"{_fmt_dim(Lf)}x{_fmt_dim(Wf)}x{_fmt_dim(Hf)}"
+        volume = Lf * Wf * Hf / 1_000_000.0
+    elif L or W or H:
         dims = f"{L or 0}x{W or 0}x{H or 0}"
-    try:
-        Lf = float(L or 0)
-        Wf = float(W or 0)
-        Hf = float(H or 0)
-        volume = (Lf * Wf * Hf / 1_000_000.0) if (
-            Lf and Wf and Hf) else None
-    except ValueError:
+        volume = None
+    else:
+        dims = ""
         volume = None
 
     conn = sqlite3.connect(db_path)
