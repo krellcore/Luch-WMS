@@ -153,7 +153,8 @@ class Api {
         return MeInfo(fio, roles)
     }
 
-    fun loadSettings() {
+    /** POST /settings. Возвращает true при успехе. */
+    fun loadSettings(): Boolean {
         val r = post("/settings", withToken())
         if (r.get("ok")?.asBoolean == true) {
             settings.clear()
@@ -164,7 +165,9 @@ class Api {
                         catch (_: Exception) {}
                     }
                 }
+            return true
         }
+        return false
     }
 
     fun capabilitiesHello(
@@ -184,6 +187,7 @@ class Api {
         return r.get("ok")?.asBoolean == true
     }
 
+    /** GET-подобный: читает список языков из /ui_config. */
     fun loadLocales(): Map<String, ServerLocale>? {
         val r = post("/ui_config", emptyMap())
         if (r.get("ok")?.asBoolean != true) return null

@@ -755,8 +755,10 @@ class Handler(BaseHTTPRequestHandler):
                     result = {"ok": True}
                 if not result.get("ok"):
                     return self._send(200, result)
-                doc = self._mgmt_build_page(
-                    key, m["login"], m["role"], ctx)
+                doc = result.get("view")
+                if not doc:
+                    doc = self._mgmt_build_page(
+                        key, m["login"], m["role"], ctx)
                 try:
                     doc = hook_registry.call_filter(
                         "on_mgmt_page_build", doc,

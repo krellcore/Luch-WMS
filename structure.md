@@ -1,6 +1,6 @@
 # Луч — Структура проекта
 
-Версия **1.0.0**
+Версия **1.0.1**
 
 ```
 корень_проекта/
@@ -8,7 +8,8 @@
 │                                 выбор способа запуска
 │                                 (сервер+клиент / только сервер);
 │                                 ServerStatusWindow — метрики сервера;
-│                                 кнопка «↗» — удалённый клиент
+│                                 кнопка «↗» — удалённый клиент;
+│                                 селектор языка из available_locales()
 ├── requirements.txt              зависимости серверной части
 ├── README.md                     общее описание системы
 ├── USER_GUIDE.md                 руководство пользователя
@@ -20,7 +21,7 @@
 ├── icon.png                      иконка приложения
 ├── logo_horizontal.png           горизонтальный логотип
 ├── config.json                   (создаётся автоматически;
-│                                 last_server для pre-fill)
+│                                 last_server, locale)
 │
 ├── lang/
 │   ├── ru.json                   словарь русского языка
@@ -89,12 +90,15 @@
 │   │   ├── settings.py
 │   │   ├── plugins_page.py
 │   │   ├── employees.py          динамические роли из roles.py
-│   │   ├── notifications.py      динамические роли из roles.py
+│   │   ├── notifications.py      динамические роли из roles.py;
+│   │   │                         _translate_row_msg для legacy-payload
 │   │   ├── drop_points.py
 │   │   ├── items.py
-│   │   ├── containers.py
+│   │   ├── containers.py         manual_receive — таблица тар + товаров
 │   │   ├── managers.py
-│   │   ├── tasks.py              список + панель + отчёт + wizard
+│   │   ├── tasks.py              список + панель + отчёт + wizard;
+│   │   │                         отчёты по типам (pick/receive/
+│   │   │                         putaway/inventory)
 │   │   └── viewer.py             список ячеек + карточка + ручные операции
 │   │
 │   ├── server.py                 HTTP-сервер (протокол v1.0):
@@ -114,13 +118,17 @@
 │   │                             заблокирован, работает только
 │   │                             /sessions/receive/*.
 │   ├── ui_config.py              конфиг темы, текстов, языков,
-│   │                             меню (для /ui_config)
+│   │                             меню, ролей (для /ui_config)
 │   │
 │   ├── wms.py                    окно склада (mgmt-клиент).
 │   │                             Режимы:
 │   │                               wms.py <папка>  — сервер+клиент
 │   │                               wms.py --server URL [<папка>]
 │   │                                                — удалённо
+│   │                             При активации плагина mgmt-страница
+│   │                             сразу добавляется в сайдбар;
+│   │                             _refresh_pages_from_server подтягивает
+│   │                             список с /mgmt/pages в удалённом режиме.
 │   ├── wms_server.py             headless-сервер (без Qt-виджетов):
 │   │                               python utils/wms_server.py <папка>
 │   │                             QT_QPA_PLATFORM=offscreen по умолчанию
@@ -131,7 +139,7 @@
 │   │   ├── __init__.py
 │   │   ├── base.py
 │   │   ├── utils.py
-│   │   ├── pick.py
+│   │   ├── pick.py               bf_prefix из адреса ячейки
 │   │   ├── receive.py            ТОЛЬКО handle_scan; используется
 │   │   │                         сессией приёмки; поток /tasks/*
 │   │   │                         для receive заблокирован в server.py
@@ -146,12 +154,18 @@
 │
 ├── client_desktop/               ПК-терминал (PySide6, тонкий
 │                                 клиент на view-протоколе v1.0)
-│   ├── main.py
-│   ├── api.py
+│   ├── main.py                   кэш ui_config и settings;
+│   │                             _apply_locales без фильтра client.*;
+│   │                             tr() с null-safe fallback
+│   ├── api.py                    ui_config_version(), ui_config(),
+│   │                             load_settings() → bool
+│   ├── config.py                 get_ui_cache/set_ui_cache,
+│   │                             get_settings_cache/set_settings_cache
 │   ├── scanner.py
-│   ├── config.py
 │   ├── icon.png
 │   ├── logo_horizontal.png
+│   ├── config.json               (создаётся; ui_cache, settings_cache,
+│   │                             locale, server)
 │   └── requirements.txt
 │
 └── WMSClient/                    Android-клиент (Kotlin, Compose)
@@ -168,16 +182,17 @@
             │   ├── MainActivity.kt         Compose-UI + dispatchKeyEvent
             │   │                           для HID-сканера + AppTheme +
             │   │                           все экраны + EmbeddedCameraScanner
-            │   ├── WmsViewModel.kt
+            │   ├── WmsViewModel.kt         roleLabel(), кэш settings
             │   ├── UiConfigStore.kt
             │   ├── ActionDispatcher.kt
             │   ├── Heartbeat.kt
             │   ├── NotificationsPoller.kt
-            │   ├── Lang.kt                универсальная локализация
-            │   │                           (встроенные ru/en + сервер)
+            │   ├── Lang.kt                 универсальная локализация
+            │   │                           (без фильтра client.*);
+            │   │                           t() с null-safe fallback
             │   ├── api/
-            │   │   ├── Api.kt
-            │   │   └── UiConfig.kt
+            │   │   ├── Api.kt              loadSettings() → bool
+            │   │   └── UiConfig.kt         RoleInfo, uiConfig.roles
             │   └── view/
             │       ├── ViewNode.kt
             │       └── ViewRenderer.kt
@@ -206,9 +221,9 @@
   вводится в диалоге логина) или
   `wms.py --server http://<ip>:8765`.
 
-Везде доступны все разделы (11) и wizard создания задач.
-Приёмка (`receive`) — только через сессию на ПК-терминале, не
-через поток заданий.
+Везде доступны все разделы (11 + разделы от плагинов) и wizard
+создания задач. Приёмка (`receive`) — только через сессию на
+ПК-терминале, не через поток заданий.
 
 ## Окно статуса сервера
 
@@ -224,7 +239,7 @@
 
 ## Версии
 
-- Программа: **1.0.0**
+- Программа: **1.0.1**
 - Протокол view: **1.0**
 - Протокол mgmt: **1.0**
 - API плагинов: **1.0**
@@ -262,7 +277,22 @@
   префиксом `plugin.<name>.`. В коде плагина — `context.tr("key")`.
 - **Плагины: свои роли.** `context.register_role(key, title_key=,
   title=, task_types=)` — роль появляется в карточке сотрудника,
-  в фильтрах и в `/tasks/next`. Никаких «дописываний в JSON».
+  в фильтрах и в `/tasks/next`. Реестр ролей отдаётся клиентам
+  в `/ui_config.roles`. Никаких «дописываний в JSON».
+- **Плагины: mgmt-страницы в сайдбаре сразу.** При активации
+  страница появляется в сайдбаре ПК-клиента (если роль
+  подходит). `server.py::_mgmt_page_action` уважает
+  `result["view"]`, возвращённый handler'ом — иначе открытый
+  диалог терялся бы и «кнопки не работали».
+- **Плагины: настоящий context в builder/handler.** Для
+  mgmt-страниц и menu-пунктов сервер передаёт
+  `PublicContext` активированного плагина (с `db()`, `tr()`,
+  `query()`). Fallback `_Ctx` (когда плагин не активирован)
+  предоставляет тот же минимальный API.
+- **Кэш `ui_config` и `settings`.** Оба клиента кэшируют `/ui_config`
+  (тема, экраны, меню, языки, роли) и `/settings`. Проверка
+  актуальности — только при подключении к серверу (старт / скан
+  QR). В сессии сеть для этих запросов не дёргается.
 - **Метрики.** `_ServerStats` в `server.py` собирает запросы,
   трафик и клиентов; `/status` отдаёт срез для окна статуса.
 - **Headless на Linux.** `wms_server.py` выставляет

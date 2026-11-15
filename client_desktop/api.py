@@ -183,9 +183,21 @@ class Api:
         }
 
     def load_settings(self):
-        r = self._post("/settings", self._with_token())
+        """POST /settings. Возвращает True при успехе, иначе False.
+
+        При успехе заполняет self.settings. При ошибке оставляет
+        self.settings как было (— позволяет вызывающему коду
+        подставить кэш).
+        """
+        try:
+            r = self._post("/settings", self._with_token(),
+                           timeout=8)
+        except ApiError:
+            return False
         if r.get("ok") is True:
             self.settings = r.get("settings") or {}
+            return True
+        return False
 
     def capabilities_hello(self, protocol="1.0", widgets=None,
                            actions=None, features=None,
@@ -199,46 +211,54 @@ class Api:
         })
         return r.get("ok") is True
 
-    def load_locales(self):
-        """Запрашивает /ui_config и возвращает словарь языков сервера.
+    # --------------------------------------------------------------
+    # Кэш /ui_config
+    # --------------------------------------------------------------
 
-        Формат возврата:
-          {
-            "ru": {"name": "Русский", "rtl": False,
-                    "fallback": None, "data": {...}},
-            "en": {...},
-            ...
-          }
-        Или None при любой ошибке.
+    def ui_config_version(self, local_version="", timeout=3):
+        """POST /ui_config/version → (server_version, changed).
+
+        Возвращает (None, False), если сервер недоступен или
+        ответил ошибкой.
         """
         try:
-            r = self._post("/ui_config", {})
-        except Exception as e:
-            print("load_locales:", e)
-            return None
+            r = self._post(
+                "/ui_config/version",
+                {"version": local_version},
+                timeout=timeout)
+        except ApiError:
+            return None, False
         if r.get("ok") is not True:
+            return None, False
+        return r.get("version") or "", bool(r.get("changed"))
+
+    def ui_config(self, timeout=5):
+        """POST /ui_config → (version, config|None).
+
+        (None, None) при ошибке/недоступности.
+        """
+        try:
+            r = self._post("/ui_config", {}, timeout=timeout)
+        except ApiError:
+            return None, None
+        if r.get("ok") is not True:
+            return None, None
+        return r.get("version") or "", r.get("config") or {}
+
+    def load_locales(self):
+        """Совместимость: возвращает {code: ServerLocale-like}.
+
+        Берёт из полного /ui_config. Не использовать в новом коде —
+        применяйте ui_config_version() + ui_config().
+        """
+        _ver, cfg = self.ui_config(timeout=5)
+        if not cfg:
             return None
-        cfg = r.get("config") or {}
-        loc = cfg.get("locales") or {}
-        available = loc.get("available") or []
-        data = loc.get("data") or {}
-        if not isinstance(available, list) or \
-                not isinstance(data, dict):
-            return None
-        out = {}
-        for info in available:
-            if not isinstance(info, dict):
-                continue
-            code = info.get("code")
-            if not code:
-                continue
-            out[code] = {
-                "name": info.get("name") or code.upper(),
-                "rtl": bool(info.get("rtl")),
-                "fallback": info.get("fallback"),
-                "data": data.get(code) or {},
-            }
-        return out
+        return _parse_locales(cfg)
+
+    # --------------------------------------------------------------
+    # Сессии / задачи / уведомления (без изменений)
+    # --------------------------------------------------------------
 
     def sessions_list(self):
         r = self._post("/sessions/list",
@@ -343,6 +363,10 @@ class Api:
                        self._with_token(ids=list(ids)))
         return r.get("ok") is True
 
+    # --------------------------------------------------------------
+    # Envelopes
+    # --------------------------------------------------------------
+
     def _parse_common(self, r):
         view = r.get("view") or {}
         children = view.get("children") or []
@@ -408,3 +432,24 @@ class Api:
             "message": message,
             "role_revoked": bool(r.get("role_revoked")),
         }
+
+
+def _parse_locales(cfg):
+    """config из /ui_config → {code: {name, rtl, fallback, data}}."""
+    loc = (cfg or {}).get("locales") or {}
+    available = loc.get("available") or []
+    data = loc.get("data") or {}
+    out = {}
+    for info in available:
+        if not isinstance(info, dict):
+            continue
+        code = info.get("code")
+        if not code:
+            continue
+        out[code] = {
+            "name": info.get("name") or code.upper(),
+            "rtl": bool(info.get("rtl")),
+            "fallback": info.get("fallback"),
+            "data": data.get(code) or {},
+        }
+    return out

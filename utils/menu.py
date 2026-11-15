@@ -11,6 +11,8 @@
 ВАЖНО: builder'ы НЕ должны возвращать ViewNode.heading с тем же
 текстом, что и title пункта меню. Клиент сам рендерит заголовок
 из config.menu.items[].title. Иначе заголовок дублируется.
+
+Версия приложения в About — APP_VERSION (1.0.1).
 """
 
 import traceback
@@ -18,6 +20,8 @@ import traceback
 from i18n import tr
 from view_protocol import make_document, ViewNode
 
+
+APP_VERSION = "1.0.1"
 
 _ITEMS = {}          # id -> dict
 _ORDER_COUNTER = [0]
@@ -126,7 +130,7 @@ def _build_about(login, user_roles, context):
     parts = [
         ViewNode.text(tr("client.about_text",
                          "Луч — WMS для адресного хранения.")),
-        ViewNode.caption("Version 1.0.0"),
+        ViewNode.caption(f"Version {APP_VERSION}"),
         ViewNode.spacer(8),
         ViewNode.caption(tr("client.about_user",
                             "Пользователь: {login}",

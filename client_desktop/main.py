@@ -21,10 +21,14 @@ from PySide6.QtGui import (
 
 from api import (
     Api, ApiError, ViewMeta, SessionMeta, NotificationItem,
-    SessionInfo, parse_view_node, humanize_error,
+    SessionInfo, parse_view_node, humanize_error, _parse_locales,
 )
 from scanner import ScannerBridge
-from config import load_config, save_config
+from config import (
+    load_config, save_config,
+    get_ui_cache, set_ui_cache,
+    get_settings_cache, set_settings_cache,
+)
 
 
 def _find_asset(name):
@@ -38,12 +42,8 @@ def _find_asset(name):
 
 # ================================================================
 # Встроенные fallback-переводы (ru/en).
-# Другие языки подгружаются с сервера после первого коннекта
-# и кэшируются в config.json (locales_cache).
-# Ключи с префиксом "client." из серверных lang/*.json применяются
-# к клиентским текстам автоматически (префикс снимается).
-# Ключи без "client." (plugin.*, task.*, common.*) тоже кладутся
-# в словарь под полным именем — для плагинов и ролей.
+# Остальные языки приходят с сервера через /ui_config и кэшируются
+# в config.json.ui_cache[<server>].config.locales.
 # ================================================================
 _T = {
     "ru": {
@@ -221,51 +221,59 @@ _loaded = False
 _DEFAULT = "ru"
 
 
-def _read_config_locales():
+def _read_cached_locales_all():
+    """Собрать все языки из конфига (ui_cache + legacy locales_cache)."""
     cfg = load_config()
-    cache = cfg.get("locales_cache") or {}
-    if not isinstance(cache, dict):
-        return {}
     out = {}
-    for code, entry in cache.items():
+
+    # 1) Новый формат: ui_cache[<server>].config.locales
+    ui_cache = cfg.get("ui_cache") or {}
+    for entry in ui_cache.values():
         if not isinstance(entry, dict):
             continue
-        data = entry.get("data") or {}
-        if not isinstance(data, dict):
-            continue
-        out[code] = {
-            "name": entry.get("name") or code.upper(),
-            "rtl": bool(entry.get("rtl")),
-            "fallback": entry.get("fallback"),
-            "data": data,
-        }
+        config = entry.get("config") or {}
+        locales = _parse_locales(config)
+        for code, data in locales.items():
+            if code not in out:
+                out[code] = data
+            else:
+                # мерж данных (более свежие — из ui_cache)
+                merged = dict(out[code].get("data") or {})
+                merged.update(data.get("data") or {})
+                out[code] = {
+                    "name": data.get("name") or out[code].get("name"),
+                    "rtl": bool(data.get("rtl")),
+                    "fallback": data.get("fallback")
+                                or out[code].get("fallback"),
+                    "data": merged,
+                }
+
+    # 2) Legacy: locales_cache
+    legacy = cfg.get("locales_cache") or {}
+    if isinstance(legacy, dict):
+        for code, entry in legacy.items():
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            if not isinstance(data, dict):
+                continue
+            if code not in out:
+                out[code] = {
+                    "name": entry.get("name") or code.upper(),
+                    "rtl": bool(entry.get("rtl")),
+                    "fallback": entry.get("fallback"),
+                    "data": data,
+                }
+
     return out
-
-
-def _write_config_locales(server_locales):
-    if not server_locales:
-        return
-    cfg = load_config()
-    cache = cfg.get("locales_cache") or {}
-    if not isinstance(cache, dict):
-        cache = {}
-    for code, entry in server_locales.items():
-        cache[code] = {
-            "name": entry.get("name") or code.upper(),
-            "rtl": bool(entry.get("rtl")),
-            "fallback": entry.get("fallback"),
-            "data": entry.get("data") or {},
-        }
-    cfg["locales_cache"] = cache
-    save_config(cfg)
 
 
 def _apply_locales(server_locales):
     """Мержит серверные языки во встроенные.
 
     client.* — без префикса (клиентские тексты).
-    Всё остальное (plugin.<name>.*, task.*, common.*) — под
-    полным именем, чтобы плагины и роли могли переводиться.
+    Всё остальное (plugin.<name>.*, task.*, common.*) — под полным
+    именем, чтобы плагины и роли могли переводиться.
     """
     global _loaded
     for code, entry in server_locales.items():
@@ -291,7 +299,7 @@ def _init_locales():
     global _loaded
     if _loaded:
         return
-    cached = _read_config_locales()
+    cached = _read_cached_locales_all()
     if cached:
         _apply_locales(cached)
     _loaded = True
@@ -876,10 +884,6 @@ class LoginServerScreen(QWidget):
         cfg = load_config()
         cfg["server"] = self.api.base
         save_config(cfg)
-        server_locales = self.api.load_locales()
-        if server_locales:
-            _apply_locales(server_locales)
-            _write_config_locales(server_locales)
         self.prompt.setText(f"{tr('server')} {self.api.base}")
         self.done.emit()
 
@@ -1359,7 +1363,7 @@ class TaskExecScreen(QWidget):
 
 
 # ================================================================
-# Главное окно (дизайн как у админа: тёмный сайдбар + светлый контент)
+# Главное окно
 # ================================================================
 
 class MainWindow(QMainWindow):
@@ -1382,6 +1386,12 @@ class MainWindow(QMainWindow):
         self._notif_showing = False
         self._fio = "—"
         self._roles = []
+
+        # ui_config: какой сервер / версия / применён ли
+        self._ui_version = ""
+        self._ui_data = {}
+        self._ui_applied = False
+        self._ui_applied_for = ""   # на какой api.base применён
 
         self.hidden_input = QLineEdit(self)
         self.hidden_input.setFixedSize(1, 1)
@@ -1487,7 +1497,93 @@ class MainWindow(QMainWindow):
         self._apply_styles()
         self._refresh_sidebar_user()
 
-    # ---------- Сайдбар ----------
+        # При старте: сначала применить кэш (мгновенно), потом
+        # проверить версию на сервере в фоне.
+        self._apply_cached_ui()
+        if self.api.base:
+            QTimer.singleShot(200, self._sync_ui_config)
+
+    # ------------------------------------------------------------
+    # ui_config: кэш и синхронизация
+    # ------------------------------------------------------------
+
+    def _apply_cached_ui(self):
+        if not self.api.base:
+            return
+        if self._ui_applied and self._ui_applied_for == self.api.base:
+            return
+        cfg = load_config()
+        ver, config = get_ui_cache(cfg, self.api.base)
+        if config:
+            self._ui_version = ver or ""
+            self._apply_ui_config(config)
+            return
+        # fallback — legacy: все языки из locales_cache
+        cached = _read_cached_locales_all()
+        if cached:
+            _apply_locales(cached)
+        self._ui_applied = True
+        self._ui_applied_for = self.api.base
+
+    def _apply_ui_config(self, config):
+        self._ui_data = config or {}
+        locales = _parse_locales(self._ui_data)
+        if locales:
+            _apply_locales(locales)
+        self._ui_applied = True
+        self._ui_applied_for = self.api.base
+
+    def _sync_ui_config(self):
+        """Проверить версию ui_config на сервере, при изменении —
+        скачать полностью и закэшировать.
+
+        Вызывается ТОЛЬКО при подключении к серверу:
+          - старт приложения (если api.base известен);
+          - после скана QR сервера (_go_employee).
+        """
+        if not self.api.base:
+            return
+        current_base = self.api.base
+        local_version = self._ui_version or ""
+        try:
+            version, changed = self.api.ui_config_version(
+                local_version, timeout=3)
+        except Exception as e:
+            print(f"[ui_config] version: {e}")
+            self._apply_cached_ui()
+            return
+        if version is None:
+            self._apply_cached_ui()
+            return
+        # сервер мог смениться, пока шёл запрос — не применяем
+        if self.api.base != current_base:
+            return
+        if not changed:
+            if not self._ui_applied \
+                    or self._ui_applied_for != current_base:
+                self._apply_cached_ui()
+            return
+        try:
+            ver, config = self.api.ui_config(timeout=5)
+        except Exception as e:
+            print(f"[ui_config] fetch: {e}")
+            self._apply_cached_ui()
+            return
+        if not config:
+            self._apply_cached_ui()
+            return
+        if self.api.base != current_base:
+            return
+        self._ui_version = ver or ""
+        self._apply_ui_config(config)
+        # persist
+        _cfg = load_config()
+        set_ui_cache(_cfg, current_base, self._ui_version, config)
+        save_config(_cfg)
+
+    # ------------------------------------------------------------
+    # Сайдбар
+    # ------------------------------------------------------------
 
     def _build_sidebar(self):
         sidebar = QFrame()
@@ -1589,7 +1685,9 @@ class MainWindow(QMainWindow):
         self.session_view.retranslate()
         self.task_exec.retranslate()
 
-    # ---------- Общее ----------
+    # ------------------------------------------------------------
+    # Общее
+    # ------------------------------------------------------------
 
     def _force_offline(self):
         if not self.online:
@@ -1601,6 +1699,11 @@ class MainWindow(QMainWindow):
         self._set_offline(True, tr("no_connection"))
 
     def _go_employee(self):
+        # Пользователь только что отсканировал QR сервера — это
+        # и есть "подключение к серверу". Здесь проверяем/подтягиваем
+        # ui_config. Блокирующе, но с коротким timeout (3–5 сек);
+        # на практике сервер уже доступен.
+        self._sync_ui_config()
         self._retranslate_all()
         self._retranslate_sidebar()
         self.stack.setCurrentIndex(1)
@@ -1636,8 +1739,28 @@ class MainWindow(QMainWindow):
         self._roles = list(roles or [])
         self.modes.set_user(self._fio, self._roles)
         self._refresh_sidebar_user()
+
+        # Кэшируем /settings (с fallback на кэш).
+        self._load_settings_with_cache()
+
         self._refresh_sessions()
         self.stack.setCurrentWidget(self.modes)
+
+    def _load_settings_with_cache(self):
+        login = self.api.login or ""
+        try:
+            ok = self.api.load_settings()
+        except Exception:
+            ok = False
+        cfg = load_config()
+        if ok:
+            set_settings_cache(
+                cfg, self.api.base, login, self.api.settings)
+            save_config(cfg)
+            return
+        cached = get_settings_cache(cfg, self.api.base, login)
+        if cached:
+            self.api.settings = dict(cached)
 
     def _refresh_sessions(self):
         try:
@@ -1724,8 +1847,12 @@ class MainWindow(QMainWindow):
         w = self.stack.currentWidget()
         if w is self.login_server:
             self.login_server.handle_scan(code)
-            self._retranslate_all()
-            self._retranslate_sidebar()
+            # Смена сервера — применить его кэш сразу (мгновенно),
+            # синхронизация версии идёт в _go_employee.
+            self._ui_applied = False
+            self._ui_applied_for = ""
+            self._ui_version = ""
+            self._apply_cached_ui()
         elif w is self.login_employee:
             self.login_employee.handle_scan(code)
         elif w is self.session_view:

@@ -321,8 +321,9 @@
 
 ## 6. Локализация
 
-Каждый POST-запрос клиента содержит поле `locale` (`"ru"` или
-`"en"`). Сервер возвращает все строки в view на этом языке.
+Каждый POST-запрос клиента содержит поле `locale` (`"ru"`,
+`"en"`, `"de"`, …). Сервер возвращает все строки в view на этом
+языке.
 
 Если клиент не прислал `locale`, сервер берёт его из БД склада
 (`settings.locale`).
@@ -333,6 +334,9 @@
 
 Язык **хранится на клиенте** и не влияет на других клиентов —
 несколько клиентов могут работать одновременно на разных языках.
+
+Ключи с префиксом `plugin.<name>.` (из `plugins/<name>/lang/`)
+применяются на клиенте так же, как обычные.
 
 ---
 
@@ -448,3 +452,74 @@ Android эта сессия не появится в списке и не зап
 Поле `platform` в `/tasks/next` — фильтр: если задание имеет
 `platform='pc'`, оно не появится у клиента с `platform='android'`
 (и наоборот). `platform='any'` доступно везде.
+
+---
+
+## 12. Кэширование на клиенте
+
+Клиенты (ПК-терминал, Android) **не кэшируют** ответы
+`/tasks/*`, `/sessions/*`, `/notifications/*`, `/status`, `/ping`.
+
+Кэшируются только:
+
+- **`/ui_config`** — полный конфиг (тема, экраны, языки, меню,
+  роли). Проверка актуальности — через `POST /ui_config/version`
+  `{"version": "<local>"}` → `{"version": "<server>",
+  "changed": true|false}`.
+- **`/settings`** — настройки склада, привязаны к паре
+  (server, login).
+
+Проверка выполняется **только при подключении к серверу**
+(старт приложения с сохранённым сервером или скан QR сервера).
+В течение сессии сеть для этих запросов не дёргается.
+
+Хранилище:
+
+- **ПК-терминал**: `client_desktop/config.json` —
+  `ui_cache[<server>] = {version, config}`,
+  `settings_cache[<server>\|<login>] = {settings}`.
+- **Android**: SharedPreferences `wms_ui` (`version`, `config`),
+  `wms_settings` (`<server_url>` → JSON), `wms_locales`
+  (производные от `ui_config.locales`).
+
+---
+
+## 13. `/ui_config`
+
+`POST /ui_config` (без тела, кроме `locale`) → полный конфиг:
+
+```json
+{
+  "ok": true,
+  "version": "abc123def",
+  "locale": "ru",
+  "config": {
+    "theme": {...},
+    "branding": {...},
+    "screens": {...},
+    "locales": {
+      "available": [{"code": "ru", "name": "Русский", "rtl": false,
+                     "fallback": null}, ...],
+      "data": {"ru": {...}, "en": {...}, "de": {...}}
+    },
+    "menu": {
+      "items": [{"id": "about", "title": "О программе",
+                 "kind": "view", "roles": ["any"]}, ...]
+    },
+    "roles": [
+      {"key": "picker", "title": "Подбор",
+       "title_key": "employees.role.picker"},
+      {"key": "audit", "title": "Аудит ячеек",
+       "title_key": "plugin.example_audit.audit.role_title"},
+      ...
+    ]
+  }
+}
+```
+
+`version` — `sha256(canonical_json(config))[:16]`. Изменение
+любого поля (`theme`, `branding`, `screens`, `locales`, `menu`,
+`roles`) меняет version.
+
+`POST /ui_config/version` `{"version": "<local>"}` →
+`{"ok": true, "version": "<server>", "changed": <bool>}`.

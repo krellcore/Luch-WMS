@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(_HERE, "utils"))
 
 from i18n import (  # type: ignore
     set_locale, tr, current_locale, tr_in,
+    available_locales, locale_display_name,
 )
 
 
@@ -92,7 +93,6 @@ class ServerStatusWindow(QWidget):
 
     def __init__(self, server_url, on_stop, parent=None):
         super().__init__(parent)
-        # Фиксируем язык в момент открытия.
         self._locale = current_locale()
         self.setWindowTitle(tr_in(self._locale,
                                   "status.window_title",
@@ -356,8 +356,11 @@ class MainWindow(QMainWindow):
         self.lang_label = QLabel(tr("app.language", "Язык:"))
         top_layout.addWidget(self.lang_label)
         self.lang_combo = QComboBox()
-        self.lang_combo.addItem("Русский", "ru")
-        self.lang_combo.addItem("English", "en")
+        # FIX: языки берём из utils/i18n.py (он сканирует lang/*.json),
+        # а не хардкодим ru/en. Тогда de.json (и любой другой) видны
+        # сразу после установки файла и перезапуска лаунчера.
+        for code in available_locales():
+            self.lang_combo.addItem(locale_display_name(code), code)
         idx = self.lang_combo.findData(current_locale())
         if idx >= 0:
             self.lang_combo.setCurrentIndex(idx)
@@ -424,7 +427,9 @@ class MainWindow(QMainWindow):
 
     def _on_lang_changed(self, _index):
         code = self.lang_combo.currentData()
-        if code not in ("ru", "en"):
+        # FIX: не заворачивать любой язык в ru — принимать только
+        # те, что реально есть в lang/ (проверка по available_locales).
+        if code not in available_locales():
             code = "ru"
         set_locale(code)
         cfg = load_config()
@@ -660,8 +665,6 @@ class MainWindow(QMainWindow):
         self._viewer_process.finished.connect(self.on_viewer_finished)
         self._viewer_process.errorOccurred.connect(
             self.on_viewer_error)
-        # Язык лаунчера передаётся клиенту, чтобы клиент
-        # открылся на этом же языке.
         self._viewer_process.start(
             sys.executable,
             [viewer_script, "--server", url, wh_path,

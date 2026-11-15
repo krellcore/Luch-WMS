@@ -1,5 +1,6 @@
 Пошаговая сборка APK
 ========================================
+Версия: 1.0.1
 
 Подготовка
 ----------
@@ -136,6 +137,30 @@ Debug-сборка Compose в разы медленнее release. На слаб
 - Drawer: ширина 240 dp, анимация 120 мс линейная.
 - Настройки сканера на маленьких экранах прокручиваются —
   карточки не обрезаются.
+- Локализация: Lang.loadFrom больше не фильтрует по префиксу
+  `client.` — плагинные ключи и role_* доходят до клиента.
+  Роль отображается через WmsViewModel.roleLabel() (из
+  ui_config.roles).
+- Кэш: ui_config хранится в SharedPreferences `wms_ui`
+  (version + config), проверяется через /ui_config/version
+  при старте и при скане QR. Settings — в `wms_settings`
+  (по URL сервера), fallback при недоступности /settings.
+
+
+Кэширование в Android
+---------------------
+- wms_ui.{version, config} — полный /ui_config.
+- wms_locales.{data, meta} — производные от ui_config.locales.
+- wms_settings.<server_url> — последние /settings.
+- wms.{locale, server, device_type} — локальные настройки.
+
+Проверка актуальности ui_config:
+  POST /ui_config/version {"version": "<local>"}
+  → {"ok": true, "version": "<server>", "changed": <bool>}
+
+Выполняется только при подключении к серверу (старт приложения
+с сохранённым сервером или скан QR). В течение сессии сеть
+для /ui_config и /settings не дёргается.
 
 
 Известные ограничения

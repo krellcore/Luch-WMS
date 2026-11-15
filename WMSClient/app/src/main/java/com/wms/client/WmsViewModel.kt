@@ -7,6 +7,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.gson.Gson
+import com.google.gson.reflect.TypeToken
 import com.wms.client.api.Api
 import com.wms.client.api.ApiException
 import com.wms.client.api.MenuItem
@@ -148,14 +150,19 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
             deviceType = normalized
             screen = Screen.LoginServer
         }
+
+        // Preload settings из кэша (если server сохранён).
+        val savedServer = prefs.getString("server", "") ?: ""
+        if (savedServer.isNotEmpty()) {
+            api.base = savedServer
+            val cached = loadSettingsCache(app, savedServer)
+            if (cached.isNotEmpty()) {
+                api.settings.clear()
+                api.settings.putAll(cached)
+            }
+        }
     }
 
-    /**
-     * Отображаемое имя роли.
-     * 1. Из ui_config.roles по title_key (для плагинных ролей).
-     * 2. По title (fallback).
-     * 3. По ключу role_<key> (встроенные).
-     */
     fun roleLabel(key: String): String {
         val info = roleInfo.firstOrNull { it.key == key }
         if (info != null) {
@@ -206,7 +213,15 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         api.base = url
         serverUrl = url
         screen = Screen.LoginEmployee
+        // Смена сервера = подключение к серверу: проверяем версию
+        // ui_config. Если недоступен — используем кэш.
         loadUiConfigFromServer(getApplication())
+        // Preload settings под новый сервер.
+        val cached = loadSettingsCache(getApplication(), url)
+        if (cached.isNotEmpty()) {
+            api.settings.clear()
+            api.settings.putAll(cached)
+        }
     }
 
     fun loadUiConfig(ctx: Context) {
@@ -283,7 +298,21 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
                     onResult(false, msg)
                     return@launch
                 }
-                withContext(Dispatchers.IO) { api.loadSettings() }
+                // Settings: пробуем сеть, при неудаче — кэш.
+                val ctx = getApplication<Application>()
+                val loadedOk = withContext(Dispatchers.IO) {
+                    try { api.loadSettings(); true }
+                    catch (_: Exception) { false }
+                }
+                if (loadedOk) {
+                    saveSettingsCache(ctx, api.base, api.settings)
+                } else {
+                    val cached = loadSettingsCache(ctx, api.base)
+                    if (cached.isNotEmpty()) {
+                        api.settings.clear()
+                        api.settings.putAll(cached)
+                    }
+                }
                 sendCapabilities()
                 startHeartbeat()
                 startNotifications()
@@ -291,6 +320,30 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
             }
             onResult(res.first, res.second)
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Кэш /settings (SharedPreferences "wms_settings", ключ = URL сервера)
+    // ----------------------------------------------------------------
+
+    private fun loadSettingsCache(ctx: Context, serverUrl: String): Map<String, String> {
+        if (serverUrl.isEmpty()) return emptyMap()
+        val prefs = ctx.getSharedPreferences("wms_settings", Context.MODE_PRIVATE)
+        val raw = prefs.getString(serverUrl, null) ?: return emptyMap()
+        return try {
+            val t = object : TypeToken<Map<String, String>>() {}.type
+            Gson().fromJson(raw, t) ?: emptyMap()
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun saveSettingsCache(ctx: Context, serverUrl: String, settings: Map<String, String>) {
+        if (serverUrl.isEmpty()) return
+        try {
+            val prefs = ctx.getSharedPreferences("wms_settings", Context.MODE_PRIVATE)
+            prefs.edit().putString(serverUrl, Gson().toJson(settings)).apply()
+        } catch (_: Exception) {}
     }
 
     private fun sendCapabilities() {
@@ -717,9 +770,8 @@ class WmsViewModel(app: Application) : AndroidViewModel(app) {
         currentMeta = ViewMeta()
         screen = Screen.Done
         viewModelScope.launch {
-            withContext(Dispatchers.IO) {
-                try { api.loadSettings() } catch (_: Exception) {}
-            }
+            // settings уже актуальны; при переходе к Done повторно
+            // не запрашиваем — сессия считается завершённой.
             loadModes()
         }
     }

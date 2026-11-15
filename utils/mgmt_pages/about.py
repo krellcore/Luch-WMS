@@ -12,6 +12,9 @@ from mgmt_view_builder import build_sidebar
 from i18n import tr, current_locale
 
 
+APP_VERSION = "1.0.1"
+
+
 _TABLE_STYLE = (
     'width="100%" cellpadding="20" cellspacing="0" '
     'style="background-color: white; border: 1px solid #dcdcdc; '
@@ -62,10 +65,6 @@ _LICENSE_HTML_EN = f"""
 
 
 def _license_html():
-    # Выбор по текущей локали потока-обработчика.
-    # set_locale() вызывается в server.do_POST/do_GET —
-    # так что к моменту рендера about.py уже стоит
-    # правильный язык.
     if current_locale() == "en":
         return _LICENSE_HTML_EN
     return _LICENSE_HTML_RU
@@ -98,7 +97,7 @@ def build_view(login, role, context):
                 "<b>Луч (LUCH WMS)</b> — "
                 "система управления складом.")),
         text(tr("about.version",
-                "Версия: {version}", version="1.0")),
+                "Версия: {version}", version=APP_VERSION)),
         text(tr("about.author_label",
                 "<b>Автор и правообладатель:</b> {author}",
                 author=tr("about.author", "Krellcore"))),
@@ -113,7 +112,7 @@ def build_view(login, role, context):
             group(info_children, orientation="vertical", spacing=4),
             group([], orientation="vertical", stretch=True),
         ], orientation="vertical", stretch=True)
-        
+
         header = group([
             mgmt_image(logo, width=300),
             centered_info,
@@ -128,7 +127,7 @@ def build_view(login, role, context):
            "Лицензия и правовая информация:"),
         bold=True, size=12))
     children.append(spacer(10))
-    
+
     children.append(mgmt_html(_license_html(), height=400))
 
     page = mgmt_page("about", title, children)
